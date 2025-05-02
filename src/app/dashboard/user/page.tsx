@@ -2,6 +2,7 @@
 import { useRouter } from 'next/navigation';
 import { supabase } from '../../../lib/supabase';
 import ProtectedRoute from '../../../components/ProtectedRoute';
+import Link from 'next/link';
 
 export default function UserDashboard() {
   const router = useRouter();
@@ -12,7 +13,7 @@ export default function UserDashboard() {
       console.error('Logout error:', error.message);
     }
     router.push('/');
-    router.refresh(); // Force refresh to clear client-side state
+    router.refresh();
   };
 
   return (
@@ -27,7 +28,18 @@ export default function UserDashboard() {
             Logout
           </button>
         </div>
-        <p>Welcome, User! You can submit or track grievances here.</p>
+        <div className="flex space-x-4">
+          <Link href="/dashboard/user/submit-grievance">
+            <button className="px-6 py-3 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition">
+              Submit Grievance
+            </button>
+          </Link>
+          <Link href="/dashboard/user/track-grievance">
+            <button className="px-6 py-3 bg-green-600 text-white rounded-md hover:bg-green-700 transition">
+              Track Grievance
+            </button>
+          </Link>
+        </div>
       </div>
     </ProtectedRoute>
   );
