@@ -5,6 +5,13 @@ import { useRouter, useParams } from 'next/navigation';
 import ProtectedRoute from '../../../../../components/ProtectedRoute';
 import Link from 'next/link';
 
+interface GrievanceAction {
+  id: number;
+  action_text: string;
+  created_at: string;
+  employee: { name: string; designation: string };
+}
+
 interface Grievance {
   id: number;
   title: string;
@@ -15,6 +22,7 @@ interface Grievance {
   created_at: string;
   categories: { name: string };
   profiles?: { name: string; designation: string; location: string };
+  actions?: GrievanceAction[];
 }
 
 interface Delegation {
@@ -44,7 +52,7 @@ export default function GrievanceDetails() {
       const { data: sessionData } = await supabase.auth.getSession();
       if (!sessionData.session) throw new Error('User not authenticated.');
 
-      // Fetch grievance details
+      // Fetch grievance details with actions
       const { data: grievanceData, error: grievanceError } = await supabase
         .from('grievances')
         .select(`
@@ -56,7 +64,13 @@ export default function GrievanceDetails() {
           location,
           created_at,
           categories!category_id (name),
-          profiles:assigned_employee_id (name, designation, location)
+          profiles:assigned_employee_id (name, designation, location),
+          grievance_actions!grievance_id (
+            id,
+            action_text,
+            created_at,
+            employee:profiles!grievance_actions_employee_id_fkey (name, designation)
+          )
         `)
         .eq('id', id)
         .eq('user_id', sessionData.session.user.id)
@@ -78,7 +92,22 @@ export default function GrievanceDetails() {
 
       if (delegationError) throw delegationError;
 
-      setGrievance(grievanceData as Grievance);
+      // Normalize grievance data
+      const normalizedGrievance = {
+        ...grievanceData,
+        categories: Array.isArray(grievanceData.categories) ? grievanceData.categories[0] : grievanceData.categories,
+        profiles: Array.isArray(grievanceData.profiles) ? grievanceData.profiles[0] : grievanceData.profiles,
+        actions: Array.isArray(grievanceData.grievance_actions)
+          ? grievanceData.grievance_actions.map((a: any) => ({
+              id: a.id,
+              action_text: a.action_text,
+              created_at: a.created_at,
+              employee: a.employee,
+            }))
+          : [],
+      };
+
+      setGrievance(normalizedGrievance as Grievance);
       setDelegations((delegationData || []) as Delegation[]);
     } catch (error: any) {
       console.error('Error fetching grievance:', error);
@@ -135,7 +164,7 @@ export default function GrievanceDetails() {
         {delegations.length === 0 ? (
           <p className="text-gray-600">No delegation history available.</p>
         ) : (
-          <div className="overflow-x-auto">
+          <div className="overflow-x-auto mb-6">
             <table className="w-full bg-white rounded-lg shadow-md">
               <thead>
                 <tr className="bg-blue-600 text-white">
@@ -159,6 +188,33 @@ export default function GrievanceDetails() {
               </tbody>
             </table>
           </div>
+        )}
+        <h2 className="text-2xl font-semibold mb-4">Action History</h2>
+        {grievance?.actions && grievance.actions.length > 0 ? (
+          <div className="overflow-x-auto">
+            <table className="w-full bg-white rounded-lg shadow-md">
+              <thead>
+                <tr className="bg-blue-600 text-white">
+                  <th className="p-3 text-left">Action</th>
+                  <th className="p-3 text-left">Employee</th>
+                  <th className="p-3 text-left">Date</th>
+                </tr>
+              </thead>
+              <tbody>
+                {grievance.actions.map((action) => (
+                  <tr key={action.id} className="border-b">
+                    <td className="p-3">{action.action_text}</td>
+                    <td className="p-3">
+                      {action.employee.name} ({action.employee.designation})
+                    </td>
+                    <td className="p-3">{new Date(action.created_at).toLocaleString()}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <p className="text-gray-600">No actions taken yet.</p>
         )}
       </div>
     </ProtectedRoute>

@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import ProtectedRoute from '../../../components/ProtectedRoute';
 import Tree from 'react-d3-tree';
 import Link from 'next/link';
+import { EyeIcon, XMarkIcon } from '@heroicons/react/24/outline';
 
 interface TreeNode {
   name: string;
@@ -18,6 +19,13 @@ interface Employee {
   designation: string;
 }
 
+interface GrievanceAction {
+  id: number;
+  action_text: string;
+  created_at: string;
+  employee: { name: string; designation: string };
+}
+
 interface Grievance {
   id: number;
   title: string;
@@ -29,6 +37,7 @@ interface Grievance {
   profiles?: { name: string; designation: string; location: string };
   assigned_by?: { name: string; designation: string };
   hierarchy?: TreeNode;
+  actions?: GrievanceAction[];
 }
 
 export default function EmployeeDashboard() {
@@ -38,6 +47,9 @@ export default function EmployeeDashboard() {
   const [profile, setProfile] = useState<{ id: string; category_id: number; designation: string; name: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [actionInputs, setActionInputs] = useState<{ [key: number]: string }>({});
+  const [statusInputs, setStatusInputs] = useState<{ [key: number]: string }>({});
+  const [selectedGrievance, setSelectedGrievance] = useState<Grievance | null>(null);
 
   useEffect(() => {
     fetchData();
@@ -64,7 +76,6 @@ export default function EmployeeDashboard() {
       const userId = sessionData.session.user.id;
       const designation = profileData.designation;
 
-      // Fetch grievances with all delegation history
       let grievancesQuery = supabase
         .from('grievances')
         .select(`
@@ -81,6 +92,12 @@ export default function EmployeeDashboard() {
             to_employee_id,
             from_profile:from_employee_id (name, designation),
             to_profile:to_employee_id (name, designation)
+          ),
+          grievance_actions!grievance_id (
+            id,
+            action_text,
+            created_at,
+            employee:profiles!grievance_actions_employee_id_fkey (name, designation)
           )
         `)
         .order('created_at', { ascending: false });
@@ -102,7 +119,6 @@ export default function EmployeeDashboard() {
       const { data: grievancesData, error: grievancesError } = await grievancesQuery;
       if (grievancesError) throw grievancesError;
 
-      // Fetch employees for delegation
       const { data: employeesData, error: employeesError } = await supabase
         .from('profiles')
         .select('id, name, designation')
@@ -113,16 +129,13 @@ export default function EmployeeDashboard() {
 
       if (employeesError) throw employeesError;
 
-      // Build per-grievance hierarchy
       setGrievances(
         (grievancesData || []).map((g: any) => {
-          // Initialize hierarchy with the first delegator or assigned employee
           let hierarchy: TreeNode = { name: 'Unassigned', designation: '', children: [] };
           const delegations = Array.isArray(g.grievance_delegations) ? g.grievance_delegations : [];
 
           if (delegations.length > 0) {
             const employeeMap = new Map<string, TreeNode>();
-            // Add all employees from delegations
             delegations.forEach((d: any) => {
               if (d.from_employee_id && d.from_profile) {
                 employeeMap.set(d.from_employee_id, {
@@ -140,7 +153,6 @@ export default function EmployeeDashboard() {
               }
             });
 
-            // Build tree structure
             delegations.forEach((d: any) => {
               const fromNode = d.from_employee_id ? employeeMap.get(d.from_employee_id) : null;
               const toNode = d.to_employee_id ? employeeMap.get(d.to_employee_id) : null;
@@ -152,15 +164,24 @@ export default function EmployeeDashboard() {
               }
             });
 
-            // Set root as the first delegator
             const firstDelegation = delegations[0];
             if (firstDelegation.from_employee_id) {
               hierarchy = employeeMap.get(firstDelegation.from_employee_id) || hierarchy;
             }
           } else if (g.profiles) {
-            // If no delegations but assigned, show the assigned employee
             hierarchy = { name: g.profiles.name, designation: g.profiles.designation, children: [] };
           }
+
+          const actions = Array.isArray(g.grievance_actions)
+            ? g.grievance_actions.map((a: any) => ({
+                id: a.id,
+                action_text: a.action_text,
+                created_at: a.created_at,
+                employee: a.employee,
+              })).sort((a: GrievanceAction, b: GrievanceAction) => 
+                new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+              )
+            : [];
 
           return {
             ...g,
@@ -170,6 +191,7 @@ export default function EmployeeDashboard() {
               ? { name: delegations[0].from_profile.name, designation: delegations[0].from_profile.designation }
               : undefined,
             hierarchy,
+            actions,
           };
         })
       );
@@ -198,7 +220,6 @@ export default function EmployeeDashboard() {
 
       if (updateError) throw new Error(`Grievance update failed: ${updateError.message}`);
 
-      // Insert delegation record
       const { error: delegationError } = await supabase
         .from('grievance_delegations')
         .insert({
@@ -212,7 +233,6 @@ export default function EmployeeDashboard() {
         throw new Error(`Delegation insert failed: ${delegationError.message}`);
       }
 
-      // Update department_hierarchy
       const { data: toEmployee } = await supabase
         .from('profiles')
         .select('designation')
@@ -221,7 +241,6 @@ export default function EmployeeDashboard() {
 
       if (!toEmployee) throw new Error('Assignee profile not found.');
 
-      // Use delegator's ID as parent
       const parentId = sessionData.session.user.id;
       const { error: hierarchyError } = await supabase
         .from('department_hierarchy')
@@ -249,6 +268,44 @@ export default function EmployeeDashboard() {
     }
   };
 
+  const handleActionSubmit = async (grievanceId: number) => {
+    try {
+      const { data: sessionData } = await supabase.auth.getSession();
+      if (!sessionData.session) throw new Error('User not authenticated.');
+
+      const actionText = actionInputs[grievanceId]?.trim();
+      const status = statusInputs[grievanceId] || 'Pending';
+
+      if (!actionText) throw new Error('Action text cannot be empty.');
+
+      const { error: actionError } = await supabase
+        .from('grievance_actions')
+        .insert({
+          grievance_id: grievanceId,
+          employee_id: sessionData.session.user.id,
+          action_text: actionText,
+        });
+
+      if (actionError) throw new Error(`Action insert failed: ${actionError.message}`);
+
+      const { error: statusError } = await supabase
+        .from('grievances')
+        .update({ status })
+        .eq('id', grievanceId)
+        .eq('assigned_employee_id', sessionData.session.user.id);
+
+      if (statusError) throw new Error(`Status update failed: ${statusError.message}`);
+
+      alert('Action added successfully!');
+      setActionInputs({ ...actionInputs, [grievanceId]: '' });
+      setStatusInputs({ ...statusInputs, [grievanceId]: 'Pending' });
+      fetchData();
+    } catch (error: any) {
+      console.error('Error submitting action:', error);
+      setError(error.message || 'Failed to submit action.');
+    }
+  };
+
   const handleLogout = async () => {
     const { error } = await supabase.auth.signOut();
     if (error) console.error('Logout error:', error.message);
@@ -256,111 +313,235 @@ export default function EmployeeDashboard() {
     router.refresh();
   };
 
+  const openHierarchyModal = (grievance: Grievance) => {
+    setSelectedGrievance(grievance);
+  };
+
+  const closeHierarchyModal = () => {
+    setSelectedGrievance(null);
+  };
+
   return (
     <ProtectedRoute role="employee">
-      <div className="min-h-screen p-8 bg-gray-100">
-        <div className="flex justify-between items-center mb-6">
-          <h1 className="text-3xl font-bold">Employee Dashboard</h1>
-          <div className="space-x-4">
-            <Link
-              href="/dashboard/employee/profile"
-              className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 transition"
-            >
-              Profile
-            </Link>
-            <button
-              onClick={handleLogout}
-              className="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 transition"
-            >
-              Logout
-            </button>
+      <div className="min-h-screen p-8 bg-gradient-to-br from-gray-50 to-gray-200">
+        <div className="max-w-7xl mx-auto">
+          <div className="flex justify-between items-center mb-8">
+            <h1 className="text-4xl font-extrabold text-gray-800">Employee Dashboard</h1>
+            <div className="space-x-4">
+              <Link
+                href="/dashboard/employee/profile"
+                className="px-5 py-2.5 bg-indigo-600 text-white rounded-lg shadow-md hover:bg-indigo-700 transition-all duration-300"
+              >
+                Profile
+              </Link>
+              <button
+                onClick={handleLogout}
+                className="px-5 py-2.5 bg-red-600 text-white rounded-lg shadow-md hover:bg-red-700 transition-all duration-300"
+              >
+                Logout
+              </button>
+            </div>
           </div>
-        </div>
-        {loading && <p className="text-gray-600">Loading...</p>}
-        {error && <p className="text-red-600 mb-4">{error}</p>}
-        <h2 className="text-2xl font-semibold mb-4">Grievance Delegation Hierarchies</h2>
-        <div className="mb-6">
+
+          {loading && (
+            <p className="text-gray-600 text-lg animate-pulse">Loading grievances...</p>
+          )}
+          {error && (
+            <p className="text-red-600 bg-red-100 p-4 rounded-lg mb-6 shadow-inner">{error}</p>
+          )}
+
+          <h2 className="text-3xl font-semibold text-gray-800 mb-6">Assigned Grievances</h2>
           {grievances.length === 0 ? (
-            <p className="text-gray-600">No grievance hierarchies available.</p>
+            <p className="text-gray-600 text-lg bg-white p-6 rounded-lg shadow-md">
+              No grievances assigned.
+            </p>
           ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
               {grievances.map((grievance) => (
-                <div key={grievance.id} className="bg-white p-4 rounded-lg shadow-md">
-                  <h3 className="text-lg font-medium mb-2">{grievance.title}</h3>
-                  <div style={{ height: '400px', width: '100%' }}>
-                    <Tree
-                      data={grievance.hierarchy}
-                      orientation="vertical"
-                      translate={{ x: 200, y: 50 }}
-                      pathFunc="step"
-                      nodeSize={{ x: 200, y: 100 }}
-                      renderCustomNodeElement={({ nodeDatum }) => (
-                        <g>
-                          <circle r="15" fill="#3b82f6" />
-                          <text fill="black" strokeWidth="0" x="0" y="30" textAnchor="middle">
-                            {nodeDatum.name} ({nodeDatum.designation})
-                          </text>
-                        </g>
-                      )}
-                    />
+                <div
+                  key={grievance.id}
+                  className="bg-white rounded-xl shadow-lg p-6 hover:shadow-xl transform hover:-translate-y-1 transition-all duration-300"
+                >
+                  <h3 className="text-xl font-semibold text-gray-800 mb-3">{grievance.title}</h3>
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm font-medium text-gray-600">Category:</span>
+                      <span className="text-sm text-gray-800">{grievance.categories.name}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm font-medium text-gray-600">Status:</span>
+                      <span
+                        className={`px-3 py-1 rounded-full text-sm font-medium ${
+                          grievance.status === 'Pending'
+                            ? 'bg-yellow-100 text-yellow-800'
+                            : grievance.status === 'In Progress'
+                            ? 'bg-blue-100 text-blue-800'
+                            : grievance.status === 'Resolved'
+                            ? 'bg-green-100 text-green-800'
+                            : 'bg-gray-100 text-gray-800'
+                        }`}
+                      >
+                        {grievance.status}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm font-medium text-gray-600">Priority:</span>
+                      <span
+                        className={`px-3 py-1 rounded-full text-sm font-medium ${
+                          grievance.priority === 'High'
+                            ? 'bg-red-100 text-red-800'
+                            : grievance.priority === 'Medium'
+                            ? 'bg-orange-100 text-orange-800'
+                            : 'bg-gray-100 text-gray-800'
+                        }`}
+                      >
+                        {grievance.priority}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm font-medium text-gray-600">Assigned To:</span>
+                      <span className="text-sm text-gray-800">
+                        {grievance.profiles
+                          ? `${grievance.profiles.name} (${grievance.profiles.designation})`
+                          : 'Unassigned'}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm font-medium text-gray-600">Assigned By:</span>
+                      <span className="text-sm text-gray-800">
+                        {grievance.assigned_by
+                          ? `${grievance.assigned_by.name} (${grievance.assigned_by.designation})`
+                          : 'N/A'}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="mt-6">
+                    <button
+                      onClick={() => openHierarchyModal(grievance)}
+                      className="flex items-center w-full px-4 py-2 bg-gray-200 text-gray-800 rounded-lg hover:bg-gray-300 transition-all duration-300"
+                    >
+                      <EyeIcon className="h-5 w-5 mr-2" />
+                      View Hierarchy
+                    </button>
+                  </div>
+
+                  <div className="mt-4 space-y-4">
+                    {grievance.assigned_employee_id === profile?.id && (
+                      <div className="space-y-3">
+                        <textarea
+                          value={actionInputs[grievance.id] || ''}
+                          onChange={(e) =>
+                            setActionInputs({ ...actionInputs, [grievance.id]: e.target.value })
+                          }
+                          placeholder="Enter action taken"
+                          className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-200"
+                        />
+                        <select
+                          value={statusInputs[grievance.id] || grievance.status}
+                          onChange={(e) =>
+                            setStatusInputs({ ...statusInputs, [grievance.id]: e.target.value })
+                          }
+                          className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-200"
+                        >
+                          <option value="Pending">Pending</option>
+                          <option value="In Progress">In Progress</option>
+                          <option value="Resolved">Resolved</option>
+                          <option value="Closed">Closed</option>
+                        </select>
+                        <button
+                          onClick={() => handleActionSubmit(grievance.id)}
+                          className="w-full p-3 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-all duration-300"
+                        >
+                          Submit Action
+                        </button>
+                      </div>
+                    )}
+                    {['Lead', 'Senior'].includes(profile?.designation || '') && (
+                      <select
+                        onChange={(e) => handleDelegate(grievance.id, e.target.value)}
+                        className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-200"
+                        defaultValue=""
+                      >
+                        <option value="" disabled>
+                          Delegate To
+                        </option>
+                        {employees.map((emp) => (
+                          <option key={emp.id} value={emp.id}>
+                            {emp.name} ({emp.designation})
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                    {grievance.actions && grievance.actions.length > 0 && (
+                      <div className="mt-4">
+                        <h4 className="text-sm font-semibold text-gray-700 mb-2">Action History</h4>
+                        <div
+                          className="overflow-y-auto border border-gray-200 rounded-lg max-h-[120px] scrollbar-thin scrollbar-thumb-gray-400 scrollbar-track-gray-100"
+                        >
+                          <table className="w-full bg-white">
+                            <thead>
+                              <tr className="bg-gray-100 text-gray-700 text-left text-xs uppercase">
+                                <th className="p-3">Action</th>
+                                <th className="p-3">Employee</th>
+                                <th className="p-3">Date</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {grievance.actions.map((action) => (
+                                <tr key={action.id} className="border-t text-sm text-gray-600">
+                                  <td className="p-3">{action.action_text}</td>
+                                  <td className="p-3">
+                                    {action.employee.name} ({action.employee.designation})
+                                  </td>
+                                  <td className="p-3">
+                                    {new Date(action.created_at).toLocaleString()}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
               ))}
             </div>
           )}
         </div>
-        <h2 className="text-2xl font-semibold mb-4">Grievances</h2>
-        {grievances.length === 0 ? (
-          <p className="text-gray-600">No grievances assigned.</p>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full bg-white rounded-lg shadow-md">
-              <thead>
-                <tr className="bg-blue-600 text-white">
-                  <th className="p-3 text-left">Title</th>
-                  <th className="p-3 text-left">Category</th>
-                  <th className="p-3 text-left">Status</th>
-                  <th className="p-3 text-left">Priority</th>
-                  <th className="p-3 text-left">Assigned To</th>
-                  <th className="p-3 text-left">Assigned By</th>
-                  <th className="p-3 text-left">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {grievances.map((grievance) => (
-                  <tr key={grievance.id} className="border-b">
-                    <td className="p-3">{grievance.title}</td>
-                    <td className="p-3">{grievance.categories.name}</td>
-                    <td className="p-3">{grievance.status}</td>
-                    <td className="p-3">{grievance.priority}</td>
-                    <td className="p-3">
-                      {grievance.profiles ? `${grievance.profiles.name} (${grievance.profiles.designation})` : 'Unassigned'}
-                    </td>
-                    <td className="p-3">
-                      {grievance.assigned_by ? `${grievance.assigned_by.name} (${grievance.assigned_by.designation})` : 'N/A'}
-                    </td>
-                    <td className="p-3">
-                      {['Lead', 'Senior'].includes(profile?.designation || '') && (
-                        <select
-                          onChange={(e) => handleDelegate(grievance.id, e.target.value)}
-                          className="rounded-md border-gray-300"
-                          defaultValue=""
-                        >
-                          <option value="" disabled>
-                            Delegate To
-                          </option>
-                          {employees.map((emp) => (
-                            <option key={emp.id} value={emp.id}>
-                              {emp.name} ({emp.designation})
-                            </option>
-                          ))}
-                        </select>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+
+        {/* Modal for Hierarchy Tree */}
+        {selectedGrievance && (
+          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+            <div className="bg-white rounded-lg shadow-2xl w-11/12 max-w-4xl p-6 relative">
+              <button
+                onClick={closeHierarchyModal}
+                className="absolute top-4 right-4 text-gray-600 hover:text-gray-800 transition-all duration-200"
+              >
+                <XMarkIcon className="h-6 w-6" />
+              </button>
+              <h3 className="text-2xl font-semibold text-gray-800 mb-4">
+                Delegation Hierarchy: {selectedGrievance.title}
+              </h3>
+              <div className="border border-gray-200 rounded-lg p-4" style={{ height: '500px', width: '100%' }}>
+                <Tree
+                  data={selectedGrievance.hierarchy}
+                  orientation="vertical"
+                  translate={{ x: 350, y: 50 }}
+                  pathFunc="step"
+                  nodeSize={{ x: 200, y: 100 }}
+                  renderCustomNodeElement={({ nodeDatum }) => (
+                    <g>
+                      <circle r="15" fill="#4f46e5" />
+                      <text fill="black" strokeWidth="0" x="0" y="30" textAnchor="middle">
+                        {nodeDatum.name} ({nodeDatum.designation})
+                      </text>
+                    </g>
+                  )}
+                />
+              </div>
+            </div>
           </div>
         )}
       </div>
