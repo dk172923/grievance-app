@@ -3,9 +3,9 @@ import { useState, useEffect } from 'react';
 import { supabase } from '../../../lib/supabase';
 import { useRouter } from 'next/navigation';
 import ProtectedRoute from '../../../components/ProtectedRoute';
-import Tree from 'react-d3-tree';
+import Tree, { TreeNodeDatum } from 'react-d3-tree';
 import Link from 'next/link';
-import { EyeIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { EyeIcon, XMarkIcon, BellIcon } from '@heroicons/react/24/outline';
 
 interface TreeNode {
   name: string;
@@ -32,39 +32,82 @@ interface Grievance {
   status: string;
   priority: string;
   created_at: string;
+  user_id: string;
   assigned_employee_id?: string;
   categories: { name: string };
-  profiles?: { name: string; designation: string; location: string };
+  profiles?: { name: string; designation: string; location: string; email: string };
+  submitter?: { id: string; email: string };
   assigned_by?: { name: string; designation: string };
   hierarchy?: TreeNode;
   actions?: GrievanceAction[];
+}
+
+interface Notification {
+  id: number;
+  message: string;
+  grievance_id: number;
+  is_read: boolean;
+  created_at: string;
 }
 
 export default function EmployeeDashboard() {
   const router = useRouter();
   const [grievances, setGrievances] = useState<Grievance[]>([]);
   const [employees, setEmployees] = useState<Employee[]>([]);
-  const [profile, setProfile] = useState<{ id: string; category_id: number; designation: string; name: string } | null>(null);
+  const [profile, setProfile] = useState<{ id: string; category_id: number; designation: string; name: string; email: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [actionInputs, setActionInputs] = useState<{ [key: number]: string }>({});
   const [statusInputs, setStatusInputs] = useState<{ [key: number]: string }>({});
   const [selectedGrievance, setSelectedGrievance] = useState<Grievance | null>(null);
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [showNotifications, setShowNotifications] = useState(false);
 
   useEffect(() => {
-    fetchData();
+    const initialize = async () => {
+      const sessionResponse = await supabase.auth.getSession();
+      const session = sessionResponse.data.session;
+
+      if (session) {
+        const channel = supabase
+          .channel('notifications')
+          .on(
+            'postgres_changes',
+            {
+              event: 'INSERT',
+              schema: 'public',
+              table: 'notifications',
+              filter: `user_id=eq.${session.user.id}`,
+            },
+            (payload) => {
+              setNotifications((prev) => [payload.new as Notification, ...prev]);
+            }
+          )
+          .subscribe();
+
+        await fetchData();
+        await fetchNotifications();
+
+        return () => {
+          supabase.removeChannel(channel);
+        };
+      }
+    };
+
+    initialize();
   }, []);
 
   const fetchData = async () => {
     try {
       setLoading(true);
-      const { data: sessionData } = await supabase.auth.getSession();
-      if (!sessionData.session) throw new Error('User not authenticated.');
+      const sessionResponse = await supabase.auth.getSession();
+      const session = sessionResponse.data.session;
+      if (!session) throw new Error('User not authenticated.');
 
       const { data: profileData, error: profileError } = await supabase
         .from('profiles')
-        .select('id, category_id, designation, name')
-        .eq('id', sessionData.session.user.id)
+        .select('id, category_id, designation, name, email')
+        .eq('id', session.user.id)
         .single();
 
       if (profileError || !profileData) throw new Error('Profile not found.');
@@ -73,7 +116,7 @@ export default function EmployeeDashboard() {
       if (!profileData.category_id) throw new Error('Employee profile not assigned to a department.');
 
       const categoryId = profileData.category_id;
-      const userId = sessionData.session.user.id;
+      const userId = session.user.id;
       const designation = profileData.designation;
 
       let grievancesQuery = supabase
@@ -84,9 +127,11 @@ export default function EmployeeDashboard() {
           status,
           priority,
           created_at,
+          user_id,
           assigned_employee_id,
           categories!category_id (name),
-          profiles!grievances_assigned_employee_id_fkey (name, designation, location),
+          profiles!grievances_assigned_employee_id_fkey (name, designation, location, email),
+          submitter:profiles!grievances_user_id_fkey1 (id, email),
           grievance_delegations!grievance_id (
             from_employee_id,
             to_employee_id,
@@ -173,20 +218,23 @@ export default function EmployeeDashboard() {
           }
 
           const actions = Array.isArray(g.grievance_actions)
-            ? g.grievance_actions.map((a: any) => ({
-                id: a.id,
-                action_text: a.action_text,
-                created_at: a.created_at,
-                employee: a.employee,
-              })).sort((a: GrievanceAction, b: GrievanceAction) => 
-                new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-              )
+            ? g.grievance_actions
+                .map((a: any) => ({
+                  id: a.id,
+                  action_text: a.action_text,
+                  created_at: a.created_at,
+                  employee: a.employee,
+                }))
+                .sort((a: GrievanceAction, b: GrievanceAction) =>
+                  new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+                )
             : [];
 
           return {
             ...g,
             categories: Array.isArray(g.categories) ? g.categories[0] : g.categories,
             profiles: Array.isArray(g.profiles) ? g.profiles[0] : g.profiles,
+            submitter: Array.isArray(g.submitter) ? g.submitter[0] : g.submitter,
             assigned_by: delegations[0]?.from_profile
               ? { name: delegations[0].from_profile.name, designation: delegations[0].from_profile.designation }
               : undefined,
@@ -205,13 +253,79 @@ export default function EmployeeDashboard() {
     }
   };
 
+  const fetchNotifications = async () => {
+    const sessionResponse = await supabase.auth.getSession();
+    const session = sessionResponse.data.session;
+    if (!session) return;
+
+    const { data, error } = await supabase
+      .from('notifications')
+      .select('*')
+      .eq('user_id', session.user.id)
+      .eq('is_read', false)
+      .order('created_at', { ascending: false })
+      .limit(10);
+
+    if (error) {
+      console.error('Error fetching notifications:', error);
+      return;
+    }
+
+    setNotifications(data || []);
+  };
+
+  const markNotificationAsRead = async (notificationId: number) => {
+    const { error } = await supabase
+      .from('notifications')
+      .update({ is_read: true })
+      .eq('id', notificationId);
+
+    if (error) {
+      console.error('Error marking notification as read:', error);
+      return;
+    }
+
+    setNotifications((prev) => prev.filter((notif) => notif.id !== notificationId));
+  };
+
+  const triggerNotification = async (userId: string, email: string, message: string, grievanceId: number, type: string) => {
+    try {
+      const { error: dbError } = await supabase.from('notifications').insert({
+        user_id: userId,
+        message,
+        grievance_id: grievanceId,
+        is_read: false,
+        created_at: new Date().toISOString(),
+      });
+
+      if (dbError) throw dbError;
+
+      await fetch('/api/notify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, subject: `Grievance Update: ${type}`, message }),
+      });
+    } catch (error) {
+      console.error('Error triggering notification:', error);
+    }
+  };
+
   const handleDelegate = async (grievanceId: number, toEmployeeId: string) => {
     try {
-      const { data: sessionData } = await supabase.auth.getSession();
-      if (!sessionData.session) throw new Error('User not authenticated.');
+      const sessionResponse = await supabase.auth.getSession();
+      const session = sessionResponse.data.session;
+      if (!session) throw new Error('User not authenticated.');
       if (!['Lead', 'Senior'].includes(profile?.designation || '')) {
         throw new Error('Only Lead or Senior can delegate grievances.');
       }
+
+      const { data: grievanceData } = await supabase
+        .from('grievances')
+        .select('assigned_employee_id')
+        .eq('id', grievanceId)
+        .single();
+
+      const previousAssignedEmployeeId = grievanceData?.assigned_employee_id;
 
       const { error: updateError } = await supabase
         .from('grievances')
@@ -224,7 +338,7 @@ export default function EmployeeDashboard() {
         .from('grievance_delegations')
         .insert({
           grievance_id: grievanceId,
-          from_employee_id: sessionData.session.user.id,
+          from_employee_id: session.user.id,
           to_employee_id: toEmployeeId,
         });
 
@@ -235,13 +349,13 @@ export default function EmployeeDashboard() {
 
       const { data: toEmployee } = await supabase
         .from('profiles')
-        .select('designation')
+        .select('designation, email')
         .eq('id', toEmployeeId)
         .single();
 
       if (!toEmployee) throw new Error('Assignee profile not found.');
 
-      const parentId = sessionData.session.user.id;
+      const parentId = session.user.id;
       const { error: hierarchyError } = await supabase
         .from('department_hierarchy')
         .upsert(
@@ -252,12 +366,33 @@ export default function EmployeeDashboard() {
               category_id: profile?.category_id,
             },
           ],
-          { onConflict: ['employee_id', 'category_id'] }
+          { onConflict: 'employee_id,category_id' }
         );
 
       if (hierarchyError) {
         console.error('Hierarchy upsert error:', hierarchyError);
         throw new Error(`Hierarchy upsert failed: ${hierarchyError.message}`);
+      }
+
+      const message = `Grievance #${grievanceId} has been delegated to you.`;
+      await triggerNotification(toEmployeeId, toEmployee.email, message, grievanceId, 'Delegation');
+
+      if (previousAssignedEmployeeId && previousAssignedEmployeeId !== toEmployeeId) {
+        const { data: previousEmployee } = await supabase
+          .from('profiles')
+          .select('email')
+          .eq('id', previousAssignedEmployeeId)
+          .single();
+        if (previousEmployee) {
+          const prevMessage = `Grievance #${grievanceId} has been reassigned from you.`;
+          await supabase.from('notifications').insert({
+            user_id: previousAssignedEmployeeId,
+            message: prevMessage,
+            grievance_id: grievanceId,
+            is_read: false,
+            created_at: new Date().toISOString(),
+          });
+        }
       }
 
       alert('Grievance delegated successfully!');
@@ -270,19 +405,46 @@ export default function EmployeeDashboard() {
 
   const handleActionSubmit = async (grievanceId: number) => {
     try {
-      const { data: sessionData } = await supabase.auth.getSession();
-      if (!sessionData.session) throw new Error('User not authenticated.');
+      const sessionResponse = await supabase.auth.getSession();
+      const session = sessionResponse.data.session;
+      if (!session) throw new Error('User not authenticated.');
 
       const actionText = actionInputs[grievanceId]?.trim();
-      const status = statusInputs[grievanceId] || 'Pending';
+      const newStatus = statusInputs[grievanceId] || 'Pending';
 
       if (!actionText) throw new Error('Action text cannot be empty.');
+
+      // Fetch the grievance details and join with profiles to get the submitter's email
+      const { data: grievanceData, error: grievanceError } = await supabase
+        .from('grievances')
+        .select(`
+          status,
+          user_id,
+          profiles:profiles!grievances_user_id_fkey1 (id, email, role)
+        `)
+        .eq('id', grievanceId)
+        .single();
+
+      if (grievanceError) throw new Error(`Failed to fetch grievance: ${grievanceError.message}`);
+      if (!grievanceData) throw new Error('Grievance not found.');
+
+      const oldStatus = grievanceData.status;
+      const submitterId = grievanceData.user_id;
+      const submitterProfile = Array.isArray(grievanceData.profiles) ? grievanceData.profiles[0] : grievanceData.profiles;
+
+      // Ensure the profile exists and has role 'user'
+      if (!submitterProfile || submitterProfile.role !== 'user') {
+        throw new Error('Submitter profile not found or not a user.');
+      }
+
+      const submitterEmail = submitterProfile.email;
+      if (!submitterEmail) throw new Error('Submitter email not found.');
 
       const { error: actionError } = await supabase
         .from('grievance_actions')
         .insert({
           grievance_id: grievanceId,
-          employee_id: sessionData.session.user.id,
+          employee_id: session.user.id,
           action_text: actionText,
         });
 
@@ -290,16 +452,27 @@ export default function EmployeeDashboard() {
 
       const { error: statusError } = await supabase
         .from('grievances')
-        .update({ status })
+        .update({ status: newStatus })
         .eq('id', grievanceId)
-        .eq('assigned_employee_id', sessionData.session.user.id);
+        .eq('assigned_employee_id', session.user.id);
 
       if (statusError) throw new Error(`Status update failed: ${statusError.message}`);
+
+      if (submitterId && submitterEmail) {
+        const actionMessage = `New action added to Grievance #${grievanceId}: ${actionText}`;
+        await triggerNotification(submitterId, submitterEmail, actionMessage, grievanceId, 'Action');
+
+        if (oldStatus !== newStatus) {
+          const statusMessage = `Grievance #${grievanceId} status changed from ${oldStatus} to ${newStatus}.`;
+          await triggerNotification(submitterId, submitterEmail, statusMessage, grievanceId, 'Status Change');
+        }
+      }
 
       alert('Action added successfully!');
       setActionInputs({ ...actionInputs, [grievanceId]: '' });
       setStatusInputs({ ...statusInputs, [grievanceId]: 'Pending' });
       fetchData();
+      fetchNotifications();
     } catch (error: any) {
       console.error('Error submitting action:', error);
       setError(error.message || 'Failed to submit action.');
@@ -321,13 +494,50 @@ export default function EmployeeDashboard() {
     setSelectedGrievance(null);
   };
 
+  const toggleNotifications = () => {
+    setShowNotifications(!showNotifications);
+  };
+
   return (
     <ProtectedRoute role="employee">
       <div className="min-h-screen p-8 bg-gradient-to-br from-gray-50 to-gray-200">
         <div className="max-w-7xl mx-auto">
           <div className="flex justify-between items-center mb-8">
             <h1 className="text-4xl font-extrabold text-gray-800">Employee Dashboard</h1>
-            <div className="space-x-4">
+            <div className="flex items-center space-x-4">
+              <div className="relative">
+                <button onClick={toggleNotifications} className="relative">
+                  <BellIcon className="h-8 w-8 text-gray-800 hover:text-indigo-600 transition-all duration-300" />
+                  {notifications.length > 0 && (
+                    <span className="absolute top-0 right-0 h-5 w-5 bg-red-600 text-white text-xs rounded-full flex items-center justify-center">
+                      {notifications.length}
+                    </span>
+                  )}
+                </button>
+                {showNotifications && (
+                  <div className="absolute right-0 mt-2 w-80 bg-white rounded-lg shadow-lg z-10 max-h-96 overflow-y-auto">
+                    <div className="p-4">
+                      <h3 className="text-lg font-semibold text-gray-800 mb-2">Notifications</h3>
+                      {notifications.length === 0 ? (
+                        <p className="text-gray-600">No unread notifications.</p>
+                      ) : (
+                        notifications.map((notif) => (
+                          <div
+                            key={notif.id}
+                            className="p-3 mb-2 rounded-lg bg-indigo-50 hover:bg-indigo-100 transition-all duration-200 cursor-pointer"
+                            onClick={() => markNotificationAsRead(notif.id)}
+                          >
+                            <p className="text-sm text-gray-800">{notif.message}</p>
+                            <p className="text-xs text-gray-600">
+                              {new Date(notif.created_at).toLocaleString()}
+                            </p>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
               <Link
                 href="/dashboard/employee/profile"
                 className="px-5 py-2.5 bg-indigo-600 text-white rounded-lg shadow-md hover:bg-indigo-700 transition-all duration-300"
@@ -511,7 +721,6 @@ export default function EmployeeDashboard() {
           )}
         </div>
 
-        {/* Modal for Hierarchy Tree */}
         {selectedGrievance && (
           <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
             <div className="bg-white rounded-lg shadow-2xl w-11/12 max-w-4xl p-6 relative">
@@ -535,7 +744,7 @@ export default function EmployeeDashboard() {
                     <g>
                       <circle r="15" fill="#4f46e5" />
                       <text fill="black" strokeWidth="0" x="0" y="30" textAnchor="middle">
-                        {nodeDatum.name} ({nodeDatum.designation})
+                        {nodeDatum.name} ({(nodeDatum as TreeNode).designation || ''})
                       </text>
                     </g>
                   )}
