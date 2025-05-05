@@ -4,8 +4,7 @@ import { supabase } from '../../../lib/supabase';
 import { useRouter } from 'next/navigation';
 import ProtectedRoute from '../../../components/ProtectedRoute';
 import Tree, { TreeNodeDatum } from 'react-d3-tree';
-import Link from 'next/link';
-import { EyeIcon, XMarkIcon, BellIcon } from '@heroicons/react/24/outline';
+import Header from '../../../components/Header';
 
 interface TreeNode {
   name: string;
@@ -288,8 +287,24 @@ export default function EmployeeDashboard() {
     setNotifications((prev) => prev.filter((notif) => notif.id !== notificationId));
   };
 
-  const triggerNotification = async (userId: string, email: string, message: string, grievanceId: number, type: string) => {
+  const triggerNotification = async (userId: string, email: string, messageTemplate: string, grievanceId: number, type: string) => {
     try {
+      // Fetch the grievance title
+      const { data: grievanceData, error: grievanceError } = await supabase
+        .from('grievances')
+        .select('title')
+        .eq('id', grievanceId)
+        .single();
+
+      if (grievanceError || !grievanceData) {
+        console.error('Error fetching grievance title:', grievanceError);
+        return;
+      }
+
+      const grievanceTitle = grievanceData.title;
+      // Replace the grievance ID with the title in the message
+      const message = messageTemplate.replace(`#${grievanceId}`, `'${grievanceTitle}'`);
+
       const { error: dbError } = await supabase.from('notifications').insert({
         user_id: userId,
         message,
@@ -321,11 +336,13 @@ export default function EmployeeDashboard() {
 
       const { data: grievanceData } = await supabase
         .from('grievances')
-        .select('assigned_employee_id')
+        .select('assigned_employee_id, user_id, profiles:profiles!grievances_user_id_fkey1 (id, email, role)')
         .eq('id', grievanceId)
         .single();
 
       const previousAssignedEmployeeId = grievanceData?.assigned_employee_id;
+      const submitterId = grievanceData?.user_id;
+      const submitterProfile = Array.isArray(grievanceData?.profiles) ? grievanceData.profiles[0] : grievanceData?.profiles;
 
       const { error: updateError } = await supabase
         .from('grievances')
@@ -349,7 +366,7 @@ export default function EmployeeDashboard() {
 
       const { data: toEmployee } = await supabase
         .from('profiles')
-        .select('designation, email')
+        .select('designation, email, name')
         .eq('id', toEmployeeId)
         .single();
 
@@ -377,6 +394,14 @@ export default function EmployeeDashboard() {
       const message = `Grievance #${grievanceId} has been delegated to you.`;
       await triggerNotification(toEmployeeId, toEmployee.email, message, grievanceId, 'Delegation');
 
+      if (profile?.designation === 'Lead' && submitterId && submitterProfile?.role === 'user') {
+        const submitterEmail = submitterProfile.email;
+        if (submitterEmail) {
+          const userMessage = `Your Grievance #${grievanceId} has been assigned to ${toEmployee.name} (${toEmployee.designation}).`;
+          await triggerNotification(submitterId, submitterEmail, userMessage, grievanceId, 'Assignment');
+        }
+      }
+
       if (previousAssignedEmployeeId && previousAssignedEmployeeId !== toEmployeeId) {
         const { data: previousEmployee } = await supabase
           .from('profiles')
@@ -385,13 +410,7 @@ export default function EmployeeDashboard() {
           .single();
         if (previousEmployee) {
           const prevMessage = `Grievance #${grievanceId} has been reassigned from you.`;
-          await supabase.from('notifications').insert({
-            user_id: previousAssignedEmployeeId,
-            message: prevMessage,
-            grievance_id: grievanceId,
-            is_read: false,
-            created_at: new Date().toISOString(),
-          });
+          await triggerNotification(previousAssignedEmployeeId, previousEmployee.email, prevMessage, grievanceId, 'Reassignment');
         }
       }
 
@@ -414,7 +433,6 @@ export default function EmployeeDashboard() {
 
       if (!actionText) throw new Error('Action text cannot be empty.');
 
-      // Fetch the grievance details and join with profiles to get the submitter's email
       const { data: grievanceData, error: grievanceError } = await supabase
         .from('grievances')
         .select(`
@@ -432,7 +450,6 @@ export default function EmployeeDashboard() {
       const submitterId = grievanceData.user_id;
       const submitterProfile = Array.isArray(grievanceData.profiles) ? grievanceData.profiles[0] : grievanceData.profiles;
 
-      // Ensure the profile exists and has role 'user'
       if (!submitterProfile || submitterProfile.role !== 'user') {
         throw new Error('Submitter profile not found or not a user.');
       }
@@ -479,13 +496,6 @@ export default function EmployeeDashboard() {
     }
   };
 
-  const handleLogout = async () => {
-    const { error } = await supabase.auth.signOut();
-    if (error) console.error('Logout error:', error.message);
-    router.push('/');
-    router.refresh();
-  };
-
   const openHierarchyModal = (grievance: Grievance) => {
     setSelectedGrievance(grievance);
   };
@@ -500,69 +510,34 @@ export default function EmployeeDashboard() {
 
   return (
     <ProtectedRoute role="employee">
-      <div className="min-h-screen p-8 bg-gradient-to-br from-gray-50 to-gray-200">
-        <div className="max-w-7xl mx-auto">
-          <div className="flex justify-between items-center mb-8">
-            <h1 className="text-4xl font-extrabold text-gray-800">Employee Dashboard</h1>
-            <div className="flex items-center space-x-4">
-              <div className="relative">
-                <button onClick={toggleNotifications} className="relative">
-                  <BellIcon className="h-8 w-8 text-gray-800 hover:text-indigo-600 transition-all duration-300" />
-                  {notifications.length > 0 && (
-                    <span className="absolute top-0 right-0 h-5 w-5 bg-red-600 text-white text-xs rounded-full flex items-center justify-center">
-                      {notifications.length}
-                    </span>
-                  )}
-                </button>
-                {showNotifications && (
-                  <div className="absolute right-0 mt-2 w-80 bg-white rounded-lg shadow-lg z-10 max-h-96 overflow-y-auto">
-                    <div className="p-4">
-                      <h3 className="text-lg font-semibold text-gray-800 mb-2">Notifications</h3>
-                      {notifications.length === 0 ? (
-                        <p className="text-gray-600">No unread notifications.</p>
-                      ) : (
-                        notifications.map((notif) => (
-                          <div
-                            key={notif.id}
-                            className="p-3 mb-2 rounded-lg bg-indigo-50 hover:bg-indigo-100 transition-all duration-200 cursor-pointer"
-                            onClick={() => markNotificationAsRead(notif.id)}
-                          >
-                            <p className="text-sm text-gray-800">{notif.message}</p>
-                            <p className="text-xs text-gray-600">
-                              {new Date(notif.created_at).toLocaleString()}
-                            </p>
-                          </div>
-                        ))
-                      )}
-                    </div>
-                  </div>
-                )}
-              </div>
-              <Link
-                href="/dashboard/employee/profile"
-                className="px-5 py-2.5 bg-indigo-600 text-white rounded-lg shadow-md hover:bg-indigo-700 transition-all duration-300"
-              >
-                Profile
-              </Link>
-              <button
-                onClick={handleLogout}
-                className="px-5 py-2.5 bg-red-600 text-white rounded-lg shadow-md hover:bg-red-700 transition-all duration-300"
-              >
-                Logout
-              </button>
-            </div>
+      <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-200">
+        <Header
+          role="employee"
+          notifications={notifications}
+          toggleNotifications={toggleNotifications}
+          markNotificationAsRead={markNotificationAsRead}
+          showNotifications={showNotifications}
+        />
+        <div className="max-w-7xl mx-auto p-8">
+          <div className="text-center mb-12">
+            <h1 className="text-4xl font-extrabold text-gray-800 animate-fade-in-down">
+              Employee Dashboard
+            </h1>
+            <p className="mt-4 text-lg text-gray-600 animate-fade-in-up">
+              Manage and resolve grievances efficiently.
+            </p>
           </div>
 
           {loading && (
-            <p className="text-gray-600 text-lg animate-pulse">Loading grievances...</p>
+            <p className="text-gray-600 text-lg animate-pulse text-center">Loading grievances...</p>
           )}
           {error && (
-            <p className="text-red-600 bg-red-100 p-4 rounded-lg mb-6 shadow-inner">{error}</p>
+            <p className="text-red-600 bg-red-100 p-4 rounded-lg mb-6 shadow-inner text-center animate-fade-in">{error}</p>
           )}
 
-          <h2 className="text-3xl font-semibold text-gray-800 mb-6">Assigned Grievances</h2>
+          <h2 className="text-3xl font-semibold text-gray-800 mb-6 animate-fade-in-down">Assigned Grievances</h2>
           {grievances.length === 0 ? (
-            <p className="text-gray-600 text-lg bg-white p-6 rounded-lg shadow-md">
+            <p className="text-gray-600 text-lg bg-white p-6 rounded-lg shadow-md text-center animate-fade-in">
               No grievances assigned.
             </p>
           ) : (
@@ -570,7 +545,7 @@ export default function EmployeeDashboard() {
               {grievances.map((grievance) => (
                 <div
                   key={grievance.id}
-                  className="bg-white rounded-xl shadow-lg p-6 hover:shadow-xl transform hover:-translate-y-1 transition-all duration-300"
+                  className="bg-white rounded-xl shadow-lg p-6 hover:shadow-xl transform hover:-translate-y-2 transition-all duration-300 animate-fade-in"
                 >
                   <h3 className="text-xl font-semibold text-gray-800 mb-3">{grievance.title}</h3>
                   <div className="space-y-3">
@@ -629,10 +604,9 @@ export default function EmployeeDashboard() {
                   <div className="mt-6">
                     <button
                       onClick={() => openHierarchyModal(grievance)}
-                      className="flex items-center w-full px-4 py-2 bg-gray-200 text-gray-800 rounded-lg hover:bg-gray-300 transition-all duration-300"
+                      className="flex items-center justify-center w-full px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-all duration-300"
                     >
-                      <EyeIcon className="h-5 w-5 mr-2" />
-                      View Hierarchy
+                      <span className="mr-2">📜</span> View Hierarchy
                     </button>
                   </div>
 
@@ -663,7 +637,7 @@ export default function EmployeeDashboard() {
                           onClick={() => handleActionSubmit(grievance.id)}
                           className="w-full p-3 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-all duration-300"
                         >
-                          Submit Action
+                          Submit
                         </button>
                       </div>
                     )}
@@ -686,9 +660,7 @@ export default function EmployeeDashboard() {
                     {grievance.actions && grievance.actions.length > 0 && (
                       <div className="mt-4">
                         <h4 className="text-sm font-semibold text-gray-700 mb-2">Action History</h4>
-                        <div
-                          className="overflow-y-auto border border-gray-200 rounded-lg max-h-[120px] scrollbar-thin scrollbar-thumb-gray-400 scrollbar-track-gray-100"
-                        >
+                        <div className="overflow-y-auto border border-gray-200 rounded-lg max-h-[120px] scrollbar-thin scrollbar-thumb-gray-400 scrollbar-track-gray-100">
                           <table className="w-full bg-white">
                             <thead>
                               <tr className="bg-gray-100 text-gray-700 text-left text-xs uppercase">
@@ -723,12 +695,12 @@ export default function EmployeeDashboard() {
 
         {selectedGrievance && (
           <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-            <div className="bg-white rounded-lg shadow-2xl w-11/12 max-w-4xl p-6 relative">
+            <div className="bg-white rounded-xl shadow-2xl w-11/12 max-w-4xl p-6 relative animate-fade-in">
               <button
                 onClick={closeHierarchyModal}
                 className="absolute top-4 right-4 text-gray-600 hover:text-gray-800 transition-all duration-200"
               >
-                <XMarkIcon className="h-6 w-6" />
+                <span className="text-2xl">✕</span>
               </button>
               <h3 className="text-2xl font-semibold text-gray-800 mb-4">
                 Delegation Hierarchy: {selectedGrievance.title}
@@ -754,6 +726,47 @@ export default function EmployeeDashboard() {
           </div>
         )}
       </div>
+      <style jsx global>{`
+        @keyframes fadeInDown {
+          from {
+            opacity: 0;
+            transform: translateY(-20px);
+          }
+          to {
+            opacity: 1;
+            transform: translateY(0);
+          }
+        }
+        @keyframes fadeInUp {
+          from {
+            opacity: 0;
+            transform: translateY(20px);
+          }
+          to {
+            opacity: 1;
+            transform: translateY(0);
+          }
+        }
+        .animate-fade-in-down {
+          animation: fadeInDown 1s ease-out;
+        }
+        .animate-fade-in-up {
+          animation: fadeInUp 1s ease-out;
+        }
+        .animate-fade-in {
+          animation: fadeInDown 1s ease-out;
+        }
+        .scrollbar-thin::-webkit-scrollbar {
+          width: 8px;
+        }
+        .scrollbar-thin::-webkit-scrollbar-thumb {
+          background-color: #a0aec0;
+          border-radius: 4px;
+        }
+        .scrollbar-thin::-webkit-scrollbar-track {
+          background-color: #edf2f7;
+        }
+      `}</style>
     </ProtectedRoute>
   );
 }
