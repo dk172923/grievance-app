@@ -14,46 +14,63 @@ interface Notification {
 }
 
 interface HeaderProps {
-  role: 'user' | 'employee';
+  role: 'user' | 'employee' | 'admin';
+  notifications?: Notification[];
+  toggleNotifications?: () => void;
+  markNotificationAsRead?: (notificationId: number) => Promise<void>;
+  showNotifications?: boolean;
 }
 
-export default function Header({ role }: HeaderProps) {
+export default function Header({ 
+  role, 
+  notifications: externalNotifications, 
+  toggleNotifications: externalToggleNotifications,
+  markNotificationAsRead: externalMarkNotificationAsRead,
+  showNotifications: externalShowNotifications
+}: HeaderProps) {
   const router = useRouter();
-  const [notifications, setNotifications] = useState<Notification[]>([]);
-  const [showNotifications, setShowNotifications] = useState(false);
+  const [localNotifications, setLocalNotifications] = useState<Notification[]>([]);
+  const [localShowNotifications, setLocalShowNotifications] = useState(false);
+
+  // Use external state if provided, otherwise use local state
+  const notifications = externalNotifications || localNotifications;
+  const showNotifications = typeof externalShowNotifications !== 'undefined' ? externalShowNotifications : localShowNotifications;
 
   useEffect(() => {
-    const initialize = async () => {
-      const sessionResponse = await supabase.auth.getSession();
-      const session = sessionResponse.data.session;
+    // Only initialize notifications if external ones aren't provided
+    if (!externalNotifications) {
+      const initialize = async () => {
+        const sessionResponse = await supabase.auth.getSession();
+        const session = sessionResponse.data.session;
 
-      if (session) {
-        const channel = supabase
-          .channel('notifications')
-          .on(
-            'postgres_changes',
-            {
-              event: 'INSERT',
-              schema: 'public',
-              table: 'notifications',
-              filter: `user_id=eq.${session.user.id}`,
-            },
-            (payload) => {
-              setNotifications((prev) => [payload.new as Notification, ...prev]);
-            }
-          )
-          .subscribe();
+        if (session) {
+          const channel = supabase
+            .channel('notifications')
+            .on(
+              'postgres_changes',
+              {
+                event: 'INSERT',
+                schema: 'public',
+                table: 'notifications',
+                filter: `user_id=eq.${session.user.id}`,
+              },
+              (payload) => {
+                setLocalNotifications((prev) => [payload.new as Notification, ...prev]);
+              }
+            )
+            .subscribe();
 
-        await fetchNotifications();
+          await fetchNotifications();
 
-        return () => {
-          supabase.removeChannel(channel);
-        };
-      }
-    };
+          return () => {
+            supabase.removeChannel(channel);
+          };
+        }
+      };
 
-    initialize();
-  }, []);
+      initialize();
+    }
+  }, [externalNotifications]);
 
   const fetchNotifications = async () => {
     const sessionResponse = await supabase.auth.getSession();
@@ -73,10 +90,16 @@ export default function Header({ role }: HeaderProps) {
       return;
     }
 
-    setNotifications(data || []);
+    setLocalNotifications(data || []);
   };
 
-  const markNotificationAsRead = async (notificationId: number) => {
+  const handleMarkNotificationAsRead = async (notificationId: number) => {
+    // Use external handler if provided
+    if (externalMarkNotificationAsRead) {
+      await externalMarkNotificationAsRead(notificationId);
+      return;
+    }
+
     const { error } = await supabase
       .from('notifications')
       .update({ is_read: true })
@@ -87,7 +110,7 @@ export default function Header({ role }: HeaderProps) {
       return;
     }
 
-    setNotifications((prev) => prev.filter((notif) => notif.id !== notificationId));
+    setLocalNotifications((prev) => prev.filter((notif) => notif.id !== notificationId));
   };
 
   const handleLogout = async () => {
@@ -97,8 +120,14 @@ export default function Header({ role }: HeaderProps) {
     router.refresh();
   };
 
-  const toggleNotifications = () => {
-    setShowNotifications(!showNotifications);
+  const handleToggleNotifications = () => {
+    // Use external handler if provided
+    if (externalToggleNotifications) {
+      externalToggleNotifications();
+      return;
+    }
+    
+    setLocalShowNotifications(!localShowNotifications);
   };
 
   return (
@@ -121,7 +150,7 @@ export default function Header({ role }: HeaderProps) {
             </Link>
           )}
           <div className="relative">
-            <button onClick={toggleNotifications} className="relative">
+            <button onClick={handleToggleNotifications} className="relative">
               <BellIcon className="h-8 w-8 text-white hover:text-gray-200 transition-all duration-300 cursor-pointer" />
               {notifications.length > 0 && (
                 <span className="absolute top-0 right-0 h-5 w-5 bg-red-600 text-white text-xs rounded-full flex items-center justify-center">
@@ -140,7 +169,7 @@ export default function Header({ role }: HeaderProps) {
                       <div
                         key={notif.id}
                         className="p-3 mb-2 rounded-lg bg-indigo-50 hover:bg-indigo-100 transition-all duration-200 cursor-pointer"
-                        onClick={() => markNotificationAsRead(notif.id)}
+                        onClick={() => handleMarkNotificationAsRead(notif.id)}
                       >
                         <p className="text-sm text-gray-800">{notif.message}</p>
                         <p className="text-xs text-gray-600">

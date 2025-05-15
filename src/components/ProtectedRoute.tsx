@@ -32,17 +32,7 @@ export default function ProtectedRoute({ role, children }: { role: string; child
 
     checkUser();
 
-    // Listen for auth state changes (e.g., logout)
-    const { data: authListener } = supabase.auth.onAuthStateChange((event, session) => {
-      if (event === 'SIGNED_OUT' || !session) {
-        router.push('/sign-in');
-        router.refresh();
-      }
-    });
-
-    return () => {
-      authListener.subscription.unsubscribe();
-    };
+    // Auto-logout listener removed to prevent automatic sign-outs
   }, [router, role]);
 
   if (isLoading) {

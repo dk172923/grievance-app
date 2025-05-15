@@ -313,13 +313,30 @@ export default function EmployeeDashboard() {
         created_at: new Date().toISOString(),
       });
 
-      if (dbError) throw dbError;
+      if (dbError) {
+        console.error('Error creating notification in database:', dbError);
+        return;
+      }
 
-      await fetch('/api/notify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, subject: `Grievance Update: ${type}`, message }),
-      });
+      // Try to send email notification, but don't fail if it doesn't work
+      try {
+        const response = await fetch('/api/notify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, subject: `Grievance Update: ${type}`, message }),
+        });
+        
+        const data = await response.json();
+        
+        if (!data.success) {
+          console.warn('Email notification not sent:', data.error || 'Unknown error');
+        } else if (data.warning) {
+          console.warn(data.warning);
+        }
+      } catch (emailError) {
+        // Just log the error but don't fail the entire notification process
+        console.error('Error sending email notification:', emailError);
+      }
     } catch (error) {
       console.error('Error triggering notification:', error);
     }
@@ -424,14 +441,27 @@ export default function EmployeeDashboard() {
 
   const handleActionSubmit = async (grievanceId: number) => {
     try {
+      // Clear any previous errors
+      setError(null);
+      
       const sessionResponse = await supabase.auth.getSession();
       const session = sessionResponse.data.session;
-      if (!session) throw new Error('User not authenticated.');
+      if (!session) {
+        setError('User not authenticated. Please log in again.');
+        return;
+      }
 
       const actionText = actionInputs[grievanceId]?.trim();
       const newStatus = statusInputs[grievanceId] || 'Pending';
 
-      if (!actionText) throw new Error('Action text cannot be empty.');
+      // Client-side validation
+      if (!actionText) {
+        setError('Action text cannot be empty. Please provide details about the action taken.');
+        // Focus on the textarea
+        const textarea = document.querySelector(`textarea[data-grievance-id="${grievanceId}"]`) as HTMLTextAreaElement;
+        if (textarea) textarea.focus();
+        return;
+      }
 
       const { data: grievanceData, error: grievanceError } = await supabase
         .from('grievances')
@@ -443,19 +473,30 @@ export default function EmployeeDashboard() {
         .eq('id', grievanceId)
         .single();
 
-      if (grievanceError) throw new Error(`Failed to fetch grievance: ${grievanceError.message}`);
-      if (!grievanceData) throw new Error('Grievance not found.');
+      if (grievanceError) {
+        setError(`Failed to fetch grievance: ${grievanceError.message}`);
+        return;
+      }
+      
+      if (!grievanceData) {
+        setError('Grievance not found. It may have been deleted or reassigned.');
+        return;
+      }
 
       const oldStatus = grievanceData.status;
       const submitterId = grievanceData.user_id;
       const submitterProfile = Array.isArray(grievanceData.profiles) ? grievanceData.profiles[0] : grievanceData.profiles;
 
       if (!submitterProfile || submitterProfile.role !== 'user') {
-        throw new Error('Submitter profile not found or not a user.');
+        setError('Submitter profile not found or not a user.');
+        return;
       }
 
       const submitterEmail = submitterProfile.email;
-      if (!submitterEmail) throw new Error('Submitter email not found.');
+      if (!submitterEmail) {
+        setError('Submitter email not found. Cannot send notification.');
+        return;
+      }
 
       const { error: actionError } = await supabase
         .from('grievance_actions')
@@ -465,7 +506,10 @@ export default function EmployeeDashboard() {
           action_text: actionText,
         });
 
-      if (actionError) throw new Error(`Action insert failed: ${actionError.message}`);
+      if (actionError) {
+        setError(`Action insert failed: ${actionError.message}`);
+        return;
+      }
 
       const { error: statusError } = await supabase
         .from('grievances')
@@ -473,7 +517,10 @@ export default function EmployeeDashboard() {
         .eq('id', grievanceId)
         .eq('assigned_employee_id', session.user.id);
 
-      if (statusError) throw new Error(`Status update failed: ${statusError.message}`);
+      if (statusError) {
+        setError(`Status update failed: ${statusError.message}`);
+        return;
+      }
 
       if (submitterId && submitterEmail) {
         const actionMessage = `New action added to Grievance #${grievanceId}: ${actionText}`;
@@ -488,6 +535,7 @@ export default function EmployeeDashboard() {
       alert('Action added successfully!');
       setActionInputs({ ...actionInputs, [grievanceId]: '' });
       setStatusInputs({ ...statusInputs, [grievanceId]: 'Pending' });
+      setError(null); // Clear any previous errors
       fetchData();
       fetchNotifications();
     } catch (error: any) {
@@ -535,162 +583,222 @@ export default function EmployeeDashboard() {
             <p className="text-red-600 bg-red-100 p-4 rounded-lg mb-6 shadow-inner text-center animate-fade-in">{error}</p>
           )}
 
-          <h2 className="text-3xl font-semibold text-gray-800 mb-6 animate-fade-in-down">Assigned Grievances</h2>
-          {grievances.length === 0 ? (
-            <p className="text-gray-600 text-lg bg-white p-6 rounded-lg shadow-md text-center animate-fade-in">
-              No grievances assigned.
-            </p>
-          ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-              {grievances.map((grievance) => (
-                <div
-                  key={grievance.id}
-                  className="bg-white rounded-xl shadow-lg p-6 hover:shadow-xl transform hover:-translate-y-2 transition-all duration-300 animate-fade-in"
-                >
-                  <h3 className="text-xl font-semibold text-gray-800 mb-3">{grievance.title}</h3>
-                  <div className="space-y-3">
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm font-medium text-gray-600">Category:</span>
-                      <span className="text-sm text-gray-800">{grievance.categories.name}</span>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm font-medium text-gray-600">Status:</span>
-                      <span
-                        className={`px-3 py-1 rounded-full text-sm font-medium ${
-                          grievance.status === 'Pending'
-                            ? 'bg-yellow-100 text-yellow-800'
-                            : grievance.status === 'In Progress'
-                            ? 'bg-blue-100 text-blue-800'
-                            : grievance.status === 'Resolved'
-                            ? 'bg-green-100 text-green-800'
-                            : 'bg-gray-100 text-gray-800'
-                        }`}
-                      >
-                        {grievance.status}
-                      </span>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm font-medium text-gray-600">Priority:</span>
-                      <span
-                        className={`px-3 py-1 rounded-full text-sm font-medium ${
-                          grievance.priority === 'High'
-                            ? 'bg-red-100 text-red-800'
-                            : grievance.priority === 'Medium'
-                            ? 'bg-orange-100 text-orange-800'
-                            : 'bg-gray-100 text-gray-800'
-                        }`}
-                      >
-                        {grievance.priority}
-                      </span>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm font-medium text-gray-600">Assigned To:</span>
-                      <span className="text-sm text-gray-800">
-                        {grievance.profiles
-                          ? `${grievance.profiles.name} (${grievance.profiles.designation})`
-                          : 'Unassigned'}
-                      </span>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm font-medium text-gray-600">Assigned By:</span>
-                      <span className="text-sm text-gray-800">
-                        {grievance.assigned_by
-                          ? `${grievance.assigned_by.name} (${grievance.assigned_by.designation})`
-                          : 'N/A'}
-                      </span>
-                    </div>
+          {showNotifications && (
+            <div className="absolute right-0 mt-2 w-80 bg-white rounded-lg shadow-lg z-30 max-h-96 overflow-y-auto">
+              <div className="p-4 border-b">
+                <h3 className="font-semibold">Notifications</h3>
+              </div>
+              {notifications.length === 0 ? (
+                <div className="p-4 text-center text-gray-500">No notifications</div>
+              ) : (
+                notifications.map((notification) => (
+                  <div
+                    key={notification.id}
+                    className={`p-4 border-b hover:bg-gray-50 ${
+                      notification.is_read ? 'opacity-75' : 'font-semibold'
+                    }`}
+                    onClick={() => markNotificationAsRead(notification.id)}
+                  >
+                    <p>{notification.message}</p>
+                    <p className="text-xs text-gray-500 mt-1">
+                      {new Date(notification.created_at).toLocaleString()}
+                    </p>
                   </div>
-
-                  <div className="mt-6">
-                    <button
-                      onClick={() => openHierarchyModal(grievance)}
-                      className="flex items-center justify-center w-full px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-all duration-300"
-                    >
-                      <span className="mr-2">📜</span> View Hierarchy
-                    </button>
-                  </div>
-
-                  <div className="mt-4 space-y-4">
-                    {grievance.assigned_employee_id === profile?.id && (
-                      <div className="space-y-3">
-                        <textarea
-                          value={actionInputs[grievance.id] || ''}
-                          onChange={(e) =>
-                            setActionInputs({ ...actionInputs, [grievance.id]: e.target.value })
-                          }
-                          placeholder="Enter action taken"
-                          className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-200"
-                        />
-                        <select
-                          value={statusInputs[grievance.id] || grievance.status}
-                          onChange={(e) =>
-                            setStatusInputs({ ...statusInputs, [grievance.id]: e.target.value })
-                          }
-                          className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-200"
-                        >
-                          <option value="Pending">Pending</option>
-                          <option value="In Progress">In Progress</option>
-                          <option value="Resolved">Resolved</option>
-                          <option value="Closed">Closed</option>
-                        </select>
-                        <button
-                          onClick={() => handleActionSubmit(grievance.id)}
-                          className="w-full p-3 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-all duration-300"
-                        >
-                          Submit
-                        </button>
-                      </div>
-                    )}
-                    {['Lead', 'Senior'].includes(profile?.designation || '') && (
-                      <select
-                        onChange={(e) => handleDelegate(grievance.id, e.target.value)}
-                        className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-200"
-                        defaultValue=""
-                      >
-                        <option value="" disabled>
-                          Delegate To
-                        </option>
-                        {employees.map((emp) => (
-                          <option key={emp.id} value={emp.id}>
-                            {emp.name} ({emp.designation})
-                          </option>
-                        ))}
-                      </select>
-                    )}
-                    {grievance.actions && grievance.actions.length > 0 && (
-                      <div className="mt-4">
-                        <h4 className="text-sm font-semibold text-gray-700 mb-2">Action History</h4>
-                        <div className="overflow-y-auto border border-gray-200 rounded-lg max-h-[120px] scrollbar-thin scrollbar-thumb-gray-400 scrollbar-track-gray-100">
-                          <table className="w-full bg-white">
-                            <thead>
-                              <tr className="bg-gray-100 text-gray-700 text-left text-xs uppercase">
-                                <th className="p-3">Action</th>
-                                <th className="p-3">Employee</th>
-                                <th className="p-3">Date</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {grievance.actions.map((action) => (
-                                <tr key={action.id} className="border-t text-sm text-gray-600">
-                                  <td className="p-3">{action.action_text}</td>
-                                  <td className="p-3">
-                                    {action.employee.name} ({action.employee.designation})
-                                  </td>
-                                  <td className="p-3">
-                                    {new Date(action.created_at).toLocaleString()}
-                                  </td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              ))}
+                ))
+              )}
             </div>
           )}
+
+          <div className="w-full max-w-6xl mx-auto mt-8 mb-8">
+            <div className="bg-white rounded-lg shadow-md p-6">
+              <h2 className="text-2xl font-semibold mb-4 text-gray-800">Data Analysis</h2>
+              <p className="mb-4 text-gray-600">Access our data visualization tools to identify problem hotspots and trends using our K-means clustering analysis.</p>
+              <a
+                href="/dashboard/employee/problem-hotspots"
+                className="inline-block px-5 py-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-all duration-300 shadow-md"
+              >
+                <span className="mr-2">📊</span> View Problem Hotspots
+              </a>
+            </div>
+          </div>
+
+          <div className="w-full max-w-6xl mx-auto">
+            {error && <div className="text-red-500 mb-4">{error}</div>}
+            {loading ? (
+              <div className="text-center">Loading grievances...</div>
+            ) : (
+              <div className="grid grid-cols-1 gap-6">
+                <h2 className="text-2xl font-semibold mb-4">Assigned Grievances</h2>
+                
+                {grievances.length === 0 ? (
+                  <div className="p-4 bg-white rounded-lg shadow-md">No grievances assigned to you.</div>
+                ) : (
+                  grievances.map((grievance) => (
+                    <div
+                      key={grievance.id}
+                      className="bg-white rounded-xl shadow-lg p-6 hover:shadow-xl transform hover:-translate-y-2 transition-all duration-300 animate-fade-in"
+                    >
+                      <h3 className="text-xl font-semibold text-gray-800 mb-3">{grievance.title}</h3>
+                      <div className="space-y-3">
+                        <div className="flex items-center justify-between">
+                          <span className="text-sm font-medium text-gray-600">Category:</span>
+                          <span className="text-sm text-gray-800">{grievance.categories.name}</span>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-sm font-medium text-gray-600">Status:</span>
+                          <span
+                            className={`px-3 py-1 rounded-full text-sm font-medium ${
+                              grievance.status === 'Pending'
+                                ? 'bg-yellow-100 text-yellow-800'
+                                : grievance.status === 'In Progress'
+                                ? 'bg-blue-100 text-blue-800'
+                                : grievance.status === 'Resolved'
+                                ? 'bg-green-100 text-green-800'
+                                : 'bg-gray-100 text-gray-800'
+                            }`}
+                          >
+                            {grievance.status}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-sm font-medium text-gray-600">Priority:</span>
+                          <span
+                            className={`px-3 py-1 rounded-full text-sm font-medium ${
+                              grievance.priority === 'High'
+                                ? 'bg-red-100 text-red-800'
+                                : grievance.priority === 'Medium'
+                                ? 'bg-orange-100 text-orange-800'
+                                : 'bg-gray-100 text-gray-800'
+                            }`}
+                          >
+                            {grievance.priority}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-sm font-medium text-gray-600">Assigned To:</span>
+                          <span className="text-sm text-gray-800">
+                            {grievance.profiles
+                              ? `${grievance.profiles.name} (${grievance.profiles.designation})`
+                              : 'Unassigned'}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-sm font-medium text-gray-600">Assigned By:</span>
+                          <span className="text-sm text-gray-800">
+                            {grievance.assigned_by
+                              ? `${grievance.assigned_by.name} (${grievance.assigned_by.designation})`
+                              : 'N/A'}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="mt-6">
+                        <button
+                          onClick={() => openHierarchyModal(grievance)}
+                          className="flex items-center justify-center w-full px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-all duration-300"
+                        >
+                          <span className="mr-2">📜</span> View Hierarchy
+                        </button>
+                      </div>
+
+                      <div className="mt-4 space-y-4">
+                        {grievance.assigned_employee_id === profile?.id && (
+                          <div className="space-y-3">
+                            <textarea
+                              value={actionInputs[grievance.id] || ''}
+                              onChange={(e) =>
+                                setActionInputs({ ...actionInputs, [grievance.id]: e.target.value })
+                              }
+                              placeholder="Enter action taken (required)"
+                              data-grievance-id={grievance.id}
+                              className={`w-full p-3 border rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-200 ${
+                                error && error.includes('Action text cannot be empty') && !actionInputs[grievance.id]?.trim()
+                                  ? 'border-red-500 bg-red-50'
+                                  : 'border-gray-300'
+                              }`}
+                              required
+                            />
+                            {error && error.includes('Action text cannot be empty') && !actionInputs[grievance.id]?.trim() && (
+                              <p className="text-red-500 text-xs mt-1">Please enter details about the action taken</p>
+                            )}
+                            <select
+                              value={statusInputs[grievance.id] || grievance.status}
+                              onChange={(e) =>
+                                setStatusInputs({ ...statusInputs, [grievance.id]: e.target.value })
+                              }
+                              className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-200"
+                            >
+                              <option value="Pending">Pending</option>
+                              <option value="In Progress">In Progress</option>
+                              <option value="Resolved">Resolved</option>
+                              <option value="Closed">Closed</option>
+                            </select>
+                            <button
+                              onClick={() => {
+                                if (!actionInputs[grievance.id]?.trim()) {
+                                  setError('Action text cannot be empty. Please provide details about the action taken.');
+                                  return;
+                                }
+                                handleActionSubmit(grievance.id);
+                              }}
+                              className="w-full p-3 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-all duration-300"
+                            >
+                              Submit
+                            </button>
+                          </div>
+                        )}
+                        {['Lead', 'Senior'].includes(profile?.designation || '') && (
+                          <select
+                            onChange={(e) => handleDelegate(grievance.id, e.target.value)}
+                            className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-200"
+                            defaultValue=""
+                          >
+                            <option value="" disabled>
+                              Delegate To
+                            </option>
+                            {employees.map((emp) => (
+                              <option key={emp.id} value={emp.id}>
+                                {emp.name} ({emp.designation})
+                              </option>
+                            ))}
+                          </select>
+                        )}
+                        {grievance.actions && grievance.actions.length > 0 && (
+                          <div className="mt-4">
+                            <h4 className="text-sm font-semibold text-gray-700 mb-2">Action History</h4>
+                            <div className="overflow-y-auto border border-gray-200 rounded-lg max-h-[120px] scrollbar-thin scrollbar-thumb-gray-400 scrollbar-track-gray-100">
+                              <table className="w-full bg-white">
+                                <thead>
+                                  <tr className="bg-gray-100 text-gray-700 text-left text-xs uppercase">
+                                    <th className="p-3">Action</th>
+                                    <th className="p-3">Employee</th>
+                                    <th className="p-3">Date</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {grievance.actions.map((action) => (
+                                    <tr key={action.id} className="border-t text-sm text-gray-600">
+                                      <td className="p-3">{action.action_text}</td>
+                                      <td className="p-3">
+                                        {action.employee.name} ({action.employee.designation})
+                                      </td>
+                                      <td className="p-3">
+                                        {new Date(action.created_at).toLocaleString()}
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
         </div>
 
         {selectedGrievance && (

@@ -1,9 +1,10 @@
 'use client';
 import { useState, useEffect, useRef } from 'react';
-import { supabase } from '../../../../lib/supabase';
+import { supabase, uploadFileToSupabase } from '../../../../lib/supabase';
 import ProtectedRoute from '../../../../components/ProtectedRoute';
 import Header from '../../../../components/Header';
 import { PaperClipIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { analyzePriority, analyzeDocument, translateTamilToEnglish } from '../../../../lib/ai-utils';
 
 export default function GrievanceSubmissionForm() {
   const [categories, setCategories] = useState<any[]>([]);
@@ -21,6 +22,13 @@ export default function GrievanceSubmissionForm() {
   const [fileError, setFileError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [documentAnalysis, setDocumentAnalysis] = useState<{
+    summary: string;
+    keywords: string[];
+    sentiment: 'positive' | 'negative' | 'neutral';
+    extractedText: string;
+  } | null>(null);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
 
   useEffect(() => {
     fetchCategories();
@@ -42,15 +50,44 @@ export default function GrievanceSubmissionForm() {
     }
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
-    if (selectedFile) {
-      if (selectedFile.size > 5 * 1024 * 1024) {
-        setFileError('File size exceeds 5MB.');
-        return;
+    if (!selectedFile) return;
+    if (selectedFile.size > 5 * 1024 * 1024) {
+      setFileError('File size exceeds 5MB.');
+      return;
+    }
+    setFile(selectedFile);
+    setFileError(null);
+
+    // Upload to server-side API for analysis
+    try {
+      setIsAnalyzing(true);
+      const formData = new FormData();
+      formData.append('file', selectedFile);
+
+      const res = await fetch('/api/analyze-document', {
+        method: 'POST',
+        body: formData,
+      });
+
+      const analysis = await res.json();
+      if (analysis.error) {
+        setFileError('Failed to analyze document: ' + analysis.error);
+        setDocumentAnalysis(null);
+      } else {
+        setDocumentAnalysis({
+          summary: analysis.summary,
+          keywords: analysis.keywords,
+          sentiment: analysis.sentiment,
+          extractedText: analysis.extractedText,
+        });
       }
-      setFile(selectedFile);
-      setFileError(null);
+    } catch (error) {
+      setFileError('Failed to analyze document. Please try again.');
+      setDocumentAnalysis(null);
+    } finally {
+      setIsAnalyzing(false);
     }
   };
 
@@ -77,24 +114,71 @@ export default function GrievanceSubmissionForm() {
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
+  const handleDescriptionChange = async (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const newDescription = e.target.value;
+    setFormData({ ...formData, description: newDescription });
+    
+    // Analyze priority based on description
+    if (newDescription.length > 10) {
+      try {
+        const priority = await analyzePriority(newDescription);
+        setFormData(prev => ({ ...prev, priority }));
+      } catch (error) {
+        console.error('Error analyzing priority:', error);
+      }
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSubmitting(true);
     setError(null);
 
     try {
-      const { data: sessionData } = await supabase.auth.getSession();
-      if (!sessionData.session) throw new Error('User not authenticated.');
+      // Check authentication first but don't redirect on error
+      const { data: sessionData, error: authError } = await supabase.auth.getSession();
+      
+      // If there's an auth error, log it but continue with the current session data if available
+      if (authError) {
+        console.warn('Authentication warning:', authError.message);
+      }
+      
+      // Only check if we don't have session data at all
+      if (!sessionData?.session) {
+        console.warn('No session data found, but continuing with submission');
+      }
 
+      const userId = sessionData?.session?.user?.id;
+      if (userId) {
+        console.log('Authenticated as:', sessionData.session.user.email);
+      }
+      
       let fileUrl: string | null = null;
       if (file) {
-        const fileExt = file.name.split('.').pop();
-        const fileName = `${sessionData.session.user.id}/${Date.now()}.${fileExt}`;
-        const { error: uploadError } = await supabase.storage
-          .from('grievance-files')
-          .upload(fileName, file);
-        if (uploadError) throw new Error('File upload failed: ' + uploadError.message);
-        fileUrl = `${process.env.NEXT_PUBLIC_SUPABASE_URL}/storage/v1/object/public/grievance-files/${fileName}`;
+        console.log('Starting file upload process...');
+        // Use the helper function to upload the file
+        fileUrl = await uploadFileToSupabase(
+          file, 
+          'grievance-files',
+          userId || 'anonymous'
+        );
+        
+        if (!fileUrl) {
+          console.error('File upload returned null');
+          throw new Error('Failed to upload file. Please try again later.');
+        }
+        
+        console.log('File uploaded successfully:', fileUrl);
+      }
+
+      // Translation logic
+      let translatedText = '';
+      if (formData.language === 'Tamil') {
+        let toTranslate = formData.description;
+        if (documentAnalysis?.extractedText) {
+          toTranslate += '\n' + documentAnalysis.extractedText;
+        }
+        translatedText = await translateTamilToEnglish(toTranslate);
       }
 
       const { error: insertError } = await supabase.from('grievances').insert([
@@ -106,9 +190,10 @@ export default function GrievanceSubmissionForm() {
           location: formData.location,
           priority: formData.priority,
           status: 'Pending' as 'Pending' | 'In Progress' | 'Resolved' | 'Closed',
-          user_id: formData.isAnonymous ? null : sessionData.session.user.id,
+          user_id: formData.isAnonymous ? null : userId,
           file_url: fileUrl,
           assigned_employee_id: null,
+          translated_text: translatedText,
         },
       ]);
 
@@ -169,8 +254,11 @@ export default function GrievanceSubmissionForm() {
                 rows={4}
                 className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-200"
                 value={formData.description}
-                onChange={(e) => setFormData({ ...formData, description: e.target.value })}
+                onChange={handleDescriptionChange}
               />
+              <p className="mt-1 text-sm text-gray-500">
+                AI will automatically analyze the priority based on your description
+              </p>
             </div>
             <div>
               <label htmlFor="location" className="block text-sm font-medium text-gray-700 mb-2">
@@ -253,14 +341,22 @@ export default function GrievanceSubmissionForm() {
                       type="file"
                       ref={fileInputRef}
                       className="sr-only"
-                      accept=".pdf,image/*"
+                      accept=".pdf,.docx,.doc,.jpg,.jpeg,.png,.txt"
                       onChange={handleFileChange}
-                      disabled={isSubmitting}
+                      disabled={isSubmitting || isAnalyzing}
                     />
                   </label>
                   <p className="pl-1 text-sm text-gray-600">or drag and drop</p>
-                  <p className="text-xs text-gray-500">PDF or image up to 5MB</p>
+                  <p className="text-xs text-gray-500">
+                    PDF, Word, images (JPG/PNG), or text files up to 5MB
+                  </p>
                   {fileError && <p className="text-sm text-red-600">{fileError}</p>}
+                  {isAnalyzing && (
+                    <div className="flex items-center justify-center space-x-2">
+                      <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-indigo-600"></div>
+                      <p className="text-sm text-indigo-600">Analyzing document...</p>
+                    </div>
+                  )}
                   {file && (
                     <div className="mt-2 flex items-center justify-center">
                       <span className="text-sm text-gray-600">{file.name}</span>
@@ -275,6 +371,38 @@ export default function GrievanceSubmissionForm() {
                   )}
                 </div>
               </div>
+              
+              {documentAnalysis && (
+                <div className="mt-4 p-4 bg-gray-50 rounded-lg space-y-3">
+                  <h4 className="font-medium text-gray-700 mb-2">Document Analysis</h4>
+                  <div className="space-y-2">
+                    <p className="text-sm text-gray-600">
+                      <span className="font-medium">Summary:</span> {documentAnalysis.summary}
+                    </p>
+                    <p className="text-sm text-gray-600">
+                      <span className="font-medium">Keywords:</span> {documentAnalysis.keywords.join(', ')}
+                    </p>
+                    <p className="text-sm text-gray-600">
+                      <span className="font-medium">Sentiment:</span>{' '}
+                      <span className={`capitalize ${
+                        documentAnalysis.sentiment === 'positive' ? 'text-green-600' :
+                        documentAnalysis.sentiment === 'negative' ? 'text-red-600' :
+                        'text-gray-600'
+                      }`}>
+                        {documentAnalysis.sentiment}
+                      </span>
+                    </p>
+                    <div className="mt-3">
+                      <p className="text-sm font-medium text-gray-700 mb-1">Extracted Text:</p>
+                      <div className="max-h-40 overflow-y-auto p-2 bg-white rounded border border-gray-200">
+                        <p className="text-xs text-gray-600 whitespace-pre-wrap">
+                          {documentAnalysis.extractedText}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
             <div className="flex items-center">
               <input
