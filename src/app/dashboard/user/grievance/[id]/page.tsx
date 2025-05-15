@@ -5,6 +5,7 @@ import { useRouter, useParams } from 'next/navigation';
 import ProtectedRoute from '../../../../../components/ProtectedRoute';
 import Link from 'next/link';
 import Header from '../../../../../components/Header';
+import { translateTamilToEnglish } from '../../../../../lib/ai-utils';
 
 interface GrievanceAction {
   id: number;
@@ -21,9 +22,12 @@ interface Grievance {
   priority: string;
   location: string;
   created_at: string;
-  categories: { name: string };
+  categories: { id: number; name: string };
   profiles?: { name: string; designation: string; location: string };
   actions?: GrievanceAction[];
+  language: string;
+  translated_text?: string;
+  ai_keywords?: string[];
 }
 
 interface Delegation {
@@ -40,12 +44,29 @@ export default function GrievanceDetails() {
   const [delegations, setDelegations] = useState<Delegation[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [showTranslation, setShowTranslation] = useState(false);
+  const [translatedText, setTranslatedText] = useState<string | null>(null);
+  const [translating, setTranslating] = useState(false);
+  const [recommendations, setRecommendations] = useState<any[]>([]);
+  const [recLoading, setRecLoading] = useState(false);
 
   useEffect(() => {
     if (id) {
       fetchGrievance();
     }
   }, [id]);
+
+  useEffect(() => {
+    if (grievance && grievance.language === 'Tamil') {
+      handleTranslation();
+    }
+  }, [grievance]);
+
+  useEffect(() => {
+    if (grievance) {
+      fetchRecommendations();
+    }
+  }, [grievance]);
 
   const fetchGrievance = async () => {
     try {
@@ -63,14 +84,18 @@ export default function GrievanceDetails() {
           priority,
           location,
           created_at,
-          categories!category_id (name),
+          category_id,
+          ai_keywords,
+          categories!category_id (id, name),
           profiles:assigned_employee_id (name, designation, location),
           grievance_actions!grievance_id (
             id,
             action_text,
             created_at,
             employee:profiles!grievance_actions_employee_id_fkey (name, designation)
-          )
+          ),
+          language,
+          translated_text
         `)
         .eq('id', id)
         .eq('user_id', sessionData.session.user.id)
@@ -103,15 +128,82 @@ export default function GrievanceDetails() {
               employee: a.employee,
             }))
           : [],
+        ai_keywords: grievanceData.ai_keywords || [],
       };
 
+      // Normalize delegations: use first element of from_employee/to_employee arrays
+      const normalizedDelegations = (delegationData || []).map((d: any) => ({
+        ...d,
+        from_employee: Array.isArray(d.from_employee) ? d.from_employee[0] : d.from_employee,
+        to_employee: Array.isArray(d.to_employee) ? d.to_employee[0] : d.to_employee,
+      }));
+
       setGrievance(normalizedGrievance as Grievance);
-      setDelegations((delegationData || []) as Delegation[]);
+      setDelegations(normalizedDelegations as Delegation[]);
     } catch (error: any) {
       console.error('Error fetching grievance:', error);
       setError(error.message || 'Failed to load grievance details.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleTranslation = async () => {
+    if (!grievance) return;
+    if (grievance.translated_text) {
+      setTranslatedText(grievance.translated_text);
+      return;
+    }
+    setTranslating(true);
+    try {
+      const textToTranslate = grievance.description;
+      const translation = await translateTamilToEnglish(textToTranslate);
+      setTranslatedText(translation);
+      // Update DB with translation
+      await supabase.from('grievances').update({ translated_text: translation }).eq('id', grievance.id);
+    } catch (err) {
+      setTranslatedText('Translation failed.');
+    } finally {
+      setTranslating(false);
+    }
+  };
+
+  const fetchRecommendations = async () => {
+    if (!grievance) return;
+    setRecLoading(true);
+    try {
+      // Fetch similar grievances by category
+      let query = supabase
+        .from('grievances')
+        .select(`id, title, description, translated_text, ai_keywords, status, priority, created_at, grievance_actions!grievance_id (action_text, created_at)`)
+        .neq('id', grievance.id)
+        .eq('category_id', grievance.categories.id)
+        .order('created_at', { ascending: false })
+        .limit(20);
+      const { data, error } = await query;
+      if (error) throw error;
+      // Simple keyword overlap ranking
+      const currentKeywords = (grievance.ai_keywords || []).map((k: string) => k.toLowerCase());
+      const scored = (data || []).map((g: any) => {
+        const gKeywords = (g.ai_keywords || []).map((k: string) => k.toLowerCase());
+        const overlap = currentKeywords.filter((k: string) => gKeywords.includes(k)).length;
+        // Simple text similarity (Jaccard)
+        const textA = (grievance.translated_text || grievance.description || '').toLowerCase();
+        const textB = (g.translated_text || g.description || '').toLowerCase();
+        const setA = new Set(textA.split(/\W+/));
+        const setB = new Set(textB.split(/\W+/));
+        const intersection = new Set([...setA].filter(x => setB.has(x)));
+        const union = new Set([...setA, ...setB]);
+        const jaccard = union.size ? intersection.size / union.size : 0;
+        return { ...g, overlap, jaccard };
+      });
+      // Sort by overlap, then jaccard
+      scored.sort((a, b) => b.overlap - a.overlap || b.jaccard - a.jaccard);
+      setRecommendations(scored.slice(0, 5));
+    } catch (err) {
+      setRecommendations([]);
+    } finally {
+      setRecLoading(false);
     }
   };
 
@@ -145,7 +237,23 @@ export default function GrievanceDetails() {
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 <div className="space-y-4">
                   <p className="text-gray-700">
-                    <strong className="text-gray-900">Description:</strong> {grievance.description}
+                    <strong className="text-gray-900">Description:</strong>
+                    {grievance.language === 'Tamil' && (
+                      <>
+                        <button
+                          className="ml-4 px-2 py-1 text-xs bg-blue-100 text-blue-700 rounded hover:bg-blue-200"
+                          onClick={() => setShowTranslation((prev) => !prev)}
+                          disabled={translating}
+                        >
+                          {showTranslation ? 'Show Original' : 'Show Translation'}
+                        </button>
+                        {translating && <span className="ml-2 text-xs text-gray-500">Translating...</span>}
+                      </>
+                    )}
+                    <br />
+                    {showTranslation && translatedText
+                      ? <span className="block mt-2 text-blue-800">{translatedText}</span>
+                      : <span className="block mt-2">{grievance.description}</span>}
                   </p>
                   <p className="text-gray-700">
                     <strong className="text-gray-900">Category:</strong> {grievance.categories.name}
@@ -258,6 +366,57 @@ export default function GrievanceDetails() {
             <p className="text-gray-600 bg-white p-6 rounded-lg shadow-md animate-fade-in">
               No actions taken yet.
             </p>
+          )}
+          <h2 className="text-3xl font-semibold text-gray-800 mb-6 animate-fade-in">Recommended Actions</h2>
+          {recLoading ? (
+            <p className="text-gray-600 bg-white p-6 rounded-lg shadow-md animate-fade-in">Loading recommendations...</p>
+          ) : recommendations.length === 0 ? (
+            <p className="text-gray-600 bg-white p-6 rounded-lg shadow-md animate-fade-in">No similar grievances found for recommendations.</p>
+          ) : (
+            <div className="space-y-6 mb-8">
+              {recommendations.map((rec) => (
+                <div key={rec.id} className="bg-gray-50 p-4 rounded-lg border border-gray-200">
+                  <div className="mb-2">
+                    <span className="font-semibold text-gray-700">{rec.title}</span>
+                    <span className="ml-2 text-xs text-gray-500">({new Date(rec.created_at).toLocaleDateString()})</span>
+                  </div>
+                  <div className="mb-2 text-sm text-gray-600">{rec.translated_text || rec.description}</div>
+                  <div className="mb-2">
+                    <span className="font-medium text-gray-700">Status:</span> {rec.status} | <span className="font-medium text-gray-700">Priority:</span> {rec.priority}
+                  </div>
+                  <div>
+                    <span className="font-medium text-gray-700">Actions Taken:</span>
+                    {rec.grievance_actions && rec.grievance_actions.length > 0 ? (
+                      <ul className="list-disc ml-6 text-sm text-gray-700">
+                        {rec.grievance_actions.map((a: any, idx: number) => (
+                          <li key={idx}>{a.action_text} <span className="text-xs text-gray-400">({new Date(a.created_at).toLocaleDateString()})</span></li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <span className="ml-2 text-gray-500">No actions recorded.</span>
+                    )}
+                  </div>
+                </div>
+              ))}
+              {/* Suggest most common actions */}
+              <div className="mt-6 p-4 bg-blue-50 rounded-lg">
+                <span className="font-semibold text-blue-700">Suggested Actions:</span>
+                <ul className="list-disc ml-6 text-blue-700">
+                  {(() => {
+                    // Aggregate actions from recommendations
+                    const allActions = recommendations.flatMap(r => (r.grievance_actions || []).map((a: any) => a.action_text));
+                    const freq: Record<string, number> = {};
+                    allActions.forEach(a => { freq[a] = (freq[a] || 0) + 1; });
+                    return Object.entries(freq)
+                      .sort((a, b) => b[1] - a[1])
+                      .slice(0, 3)
+                      .map(([action, count], idx) => (
+                        <li key={idx}>{action} <span className="text-xs">({count} times)</span></li>
+                      ));
+                  })()}
+                </ul>
+              </div>
+            </div>
           )}
         </div>
       </div>
