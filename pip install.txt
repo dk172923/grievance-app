@@ -1,0 +1,1 @@
+pip install fastapi uvicorn python-multipart fastapi-cors transformers torch datasets pandas scikit-learn numpy
