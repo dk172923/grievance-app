@@ -1,16 +1,10 @@
 'use client';
 import { useState, useEffect } from 'react';
-import { supabase } from '../../../lib/supabase';
+import { supabase } from '../../../../lib/supabase';
 import { useRouter } from 'next/navigation';
-import ProtectedRoute from '../../../components/ProtectedRoute';
-import Header from '../../../components/Header';
+import ProtectedRoute from '../../../../components/ProtectedRoute';
+import Header from '../../../../components/Header';
 import Link from 'next/link';
-
-interface Employee {
-  id: string;
-  name: string;
-  designation: string;
-}
 
 interface Grievance {
   id: number;
@@ -25,58 +19,17 @@ interface Grievance {
   assigned_by?: { name: string; designation: string };
 }
 
-interface Notification {
-  id: number;
-  message: string;
-  grievance_id: number;
-  is_read: boolean;
-  created_at: string;
-}
-
-export default function EmployeeDashboard() {
+export default function ResolvedGrievances() {
   const router = useRouter();
   const [grievances, setGrievances] = useState<Grievance[]>([]);
-  const [employees, setEmployees] = useState<Employee[]>([]);
   const [profile, setProfile] = useState<{ id: string; category_id: number; designation: string; name: string; email: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [notifications, setNotifications] = useState<Notification[]>([]);
-  const [showNotifications, setShowNotifications] = useState(false);
   const [priorityFilter, setPriorityFilter] = useState<string>('All');
 
   useEffect(() => {
-    const initialize = async () => {
-      const sessionResponse = await supabase.auth.getSession();
-      const session = sessionResponse.data.session;
-
-      if (session) {
-        const channel = supabase
-          .channel('notifications')
-          .on(
-            'postgres_changes',
-            {
-              event: 'INSERT',
-              schema: 'public',
-              table: 'notifications',
-              filter: `user_id=eq.${session.user.id}`,
-            },
-            (payload) => {
-              setNotifications((prev) => [payload.new as Notification, ...prev]);
-            }
-          )
-          .subscribe();
-
-        await fetchData();
-        await fetchNotifications();
-
-        return () => {
-          supabase.removeChannel(channel);
-        };
-      }
-    };
-
-    initialize();
-  }, [priorityFilter]); // Add priorityFilter to dependency array to refetch when it changes
+    fetchData();
+  }, [priorityFilter]); // Add priorityFilter to dependency array
 
   const fetchData = async () => {
     try {
@@ -116,7 +69,7 @@ export default function EmployeeDashboard() {
             from_profile:from_employee_id (name, designation)
           )
         `)
-        .in('status', ['Pending', 'In Progress'])
+        .in('status', ['Resolved', 'Closed'])
         .order('created_at', { ascending: false });
 
       if (priorityFilter !== 'All') {
@@ -137,18 +90,26 @@ export default function EmployeeDashboard() {
         grievancesQuery = grievancesQuery.eq('assigned_employee_id', userId);
       }
 
-      const { data: grievancesData, error: grievancesError } = await grievancesQuery;
+      const { data: grievancesData, error: grievancesError } = await supabase
+        .from('grievances')
+        .select(`
+          id,
+          title,
+          status,
+          priority,
+          created_at,
+          user_id,
+          assigned_employee_id,
+          categories!category_id (name),
+          profiles!grievances_assigned_employee_id_fkey (name, designation),
+          grievance_delegations!grievance_id (
+            from_profile:from_employee_id (name, designation)
+          )
+        `)
+        .in('status', ['Resolved', 'Closed'])
+        .order('created_at', { ascending: false });
+
       if (grievancesError) throw grievancesError;
-
-      const { data: employeesData, error: employeesError } = await supabase
-        .from('profiles')
-        .select('id, name, designation')
-        .eq('category_id', categoryId)
-        .eq('role', 'employee')
-        .neq('id', userId)
-        .in('designation', designation === 'Lead' ? ['Senior', 'Junior'] : ['Junior']);
-
-      if (employeesError) throw employeesError;
 
       const processedGrievances = (grievancesData || []).map((g: any) => ({
         ...g,
@@ -160,7 +121,6 @@ export default function EmployeeDashboard() {
       }));
 
       setGrievances(processedGrievances);
-      setEmployees(employeesData || []);
     } catch (error: any) {
       console.error('Error fetching data:', error);
       setError(error.message || 'Failed to load data.');
@@ -169,76 +129,18 @@ export default function EmployeeDashboard() {
     }
   };
 
-  const fetchNotifications = async () => {
-    const sessionResponse = await supabase.auth.getSession();
-    const session = sessionResponse.data.session;
-    if (!session) return;
-
-    const { data, error } = await supabase
-      .from('notifications')
-      .select('*')
-      .eq('user_id', session.user.id)
-      .eq('is_read', false)
-      .order('created_at', { ascending: false })
-      .limit(10);
-
-    if (error) {
-      console.error('Error fetching notifications:', error);
-      return;
-    }
-
-    setNotifications(data || []);
-  };
-
-  const markNotificationAsRead = async (notificationId: number) => {
-    const { error } = await supabase
-      .from('notifications')
-      .update({ is_read: true })
-      .eq('id', notificationId);
-
-    if (error) {
-      console.error('Error marking notification as read:', error);
-      return;
-    }
-
-    setNotifications((prev) => prev.filter((notif) => notif.id !== notificationId));
-  };
-
-  const toggleNotifications = () => {
-    setShowNotifications(!showNotifications);
-  };
-
   return (
     <ProtectedRoute role="employee">
       <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-200">
-        <Header
-          role="employee"
-          notifications={notifications}
-          toggleNotifications={toggleNotifications}
-          markNotificationAsRead={markNotificationAsRead}
-          showNotifications={showNotifications}
-        />
+        <Header role="employee" />
         <div className="max-w-7xl mx-auto p-8">
           <div className="text-center mb-12">
             <h1 className="text-4xl font-extrabold text-gray-800 animate-fade-in-down">
-              Employee Dashboard
+              Resolved and Finished Grievances
             </h1>
             <p className="mt-4 text-lg text-gray-600 animate-fade-in-up">
-              Manage and resolve grievances efficiently.
+              View grievances that have been resolved or finished.
             </p>
-          </div>
-
-          <div className="w-full max-w-6xl mx-auto mt-8 mb-8">
-            <div className="bg-white rounded-lg shadow-md p-6">
-              <h2 className="text-2xl font-semibold mb-4 text-gray-800">Data Analysis</h2>
-              <p className="mb-4 text-gray-600">Access our data visualization tools to identify problem hotspots and trends using our K-means clustering analysis.</p>
-              <a
-                href="/dashboard/employee/problem-hotspots"
-                className="inline-block px-5 py-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-all duration-300 shadow-md"
-              >
-                <span className="mr-2">📊</span> View Problem Hotspots
-              </a>
-            </div>
           </div>
 
           <div className="flex justify-between items-center mb-6">
@@ -256,10 +158,10 @@ export default function EmployeeDashboard() {
               </select>
             </div>
             <Link
-              href="/dashboard/employee/resolved"
+              href="/dashboard/employee"
               className="px-5 py-2.5 bg-indigo-600 text-white rounded-lg shadow-md hover:bg-indigo-700 transition-all duration-300"
             >
-              View Resolved/Finished Grievances
+              Back to Active Grievances
             </Link>
           </div>
 
@@ -270,10 +172,10 @@ export default function EmployeeDashboard() {
             <p className="text-red-600 bg-red-100 p-4 rounded-lg mb-6 shadow-inner text-center animate-fade-in">{error}</p>
           )}
 
-          <h2 className="text-3xl font-semibold text-gray-800 mb-6 animate-fade-in-down">Assigned Grievances</h2>
+          <h2 className="text-3xl font-semibold text-gray-800 mb-6 animate-fade-in-down">Grievances</h2>
           {grievances.length === 0 ? (
             <p className="text-gray-600 text-lg bg-white p-6 rounded-lg shadow-md text-center animate-fade-in">
-              No grievances assigned.
+              No resolved or finished grievances found.
             </p>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
@@ -292,10 +194,10 @@ export default function EmployeeDashboard() {
                       <span className="text-sm font-medium text-gray-600">Status:</span>
                       <span
                         className={`px-3 py-1 rounded-full text-sm font-medium ${
-                          grievance.status === 'Pending'
-                            ? 'bg-yellow-100 text-yellow-800'
-                            : grievance.status === 'In Progress'
-                            ? 'bg-blue-100 text-blue-800'
+                          grievance.status === 'Resolved'
+                            ? 'bg-green-100 text-green-800'
+                            : grievance.status === 'Closed'
+                            ? 'bg-gray-100 text-gray-800'
                             : 'bg-gray-100 text-gray-800'
                         }`}
                       >
@@ -335,7 +237,7 @@ export default function EmployeeDashboard() {
                   </div>
                   <div className="mt-6">
                     <Link
-                      href={`/dashboard/employee/grievance/${grievance.id}`}
+                      href={`/dashboard/employee/resolved/${grievance.id}`}
                       className="flex items-center justify-center w-full px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-all duration-300"
                     >
                       View Details

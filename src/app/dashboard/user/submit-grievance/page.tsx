@@ -1,9 +1,10 @@
 'use client';
 import { useState, useEffect, useRef } from 'react';
-import { supabase } from '../../../../lib/supabase';
+import { supabase, uploadFileToSupabase } from '../../../../lib/supabase';
 import ProtectedRoute from '../../../../components/ProtectedRoute';
 import Header from '../../../../components/Header';
 import { PaperClipIcon, XMarkIcon } from '@heroicons/react/24/outline';
+import { analyzePriority, analyzeDocument, translateTamilToEnglish } from '../../../../lib/ai-utils';
 
 export default function GrievanceSubmissionForm() {
   const [categories, setCategories] = useState<any[]>([]);
@@ -21,6 +22,13 @@ export default function GrievanceSubmissionForm() {
   const [fileError, setFileError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [documentAnalysis, setDocumentAnalysis] = useState<{
+    summary: string;
+    keywords: string[];
+    sentiment: 'positive' | 'negative' | 'neutral';
+    extractedText: string;
+  } | null>(null);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
 
   useEffect(() => {
     fetchCategories();
@@ -42,15 +50,43 @@ export default function GrievanceSubmissionForm() {
     }
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
-    if (selectedFile) {
-      if (selectedFile.size > 5 * 1024 * 1024) {
-        setFileError('File size exceeds 5MB.');
-        return;
+    if (!selectedFile) return;
+    if (selectedFile.size > 5 * 1024 * 1024) {
+      setFileError('File size exceeds 5MB.');
+      return;
+    }
+    setFile(selectedFile);
+    setFileError(null);
+
+    try {
+      setIsAnalyzing(true);
+      const formData = new FormData();
+      formData.append('file', selectedFile);
+
+      const res = await fetch('/api/analyze-document', {
+        method: 'POST',
+        body: formData,
+      });
+
+      const analysis = await res.json();
+      if (analysis.error) {
+        setFileError('Failed to analyze document: ' + analysis.error);
+        setDocumentAnalysis(null);
+      } else {
+        setDocumentAnalysis({
+          summary: analysis.summary,
+          keywords: analysis.keywords,
+          sentiment: analysis.sentiment,
+          extractedText: analysis.extractedText,
+        });
       }
-      setFile(selectedFile);
-      setFileError(null);
+    } catch (error) {
+      setFileError('Failed to analyze document. Please try again.');
+      setDocumentAnalysis(null);
+    } finally {
+      setIsAnalyzing(false);
     }
   };
 
@@ -64,6 +100,8 @@ export default function GrievanceSubmissionForm() {
       }
       setFile(droppedFile);
       setFileError(null);
+      // Trigger file analysis
+      handleFileChange({ target: { files: [droppedFile] } } as any);
     }
   };
 
@@ -74,7 +112,13 @@ export default function GrievanceSubmissionForm() {
   const removeFile = () => {
     setFile(null);
     setFileError(null);
+    setDocumentAnalysis(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const handleDescriptionChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const newDescription = e.target.value;
+    setFormData({ ...formData, description: newDescription });
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -83,20 +127,57 @@ export default function GrievanceSubmissionForm() {
     setError(null);
 
     try {
-      const { data: sessionData } = await supabase.auth.getSession();
-      if (!sessionData.session) throw new Error('User not authenticated.');
+      const { data: sessionData, error: authError } = await supabase.auth.getSession();
+      if (authError) {
+        console.warn('Authentication warning:', authError.message);
+      }
+      if (!sessionData?.session) {
+        console.warn('No session data found, but continuing with submission');
+      }
+
+      const userId = sessionData?.session?.user?.id;
+      if (userId) {
+        console.log('Authenticated as:', sessionData.session.user.email);
+      }
 
       let fileUrl: string | null = null;
       if (file) {
-        const fileExt = file.name.split('.').pop();
-        const fileName = `${sessionData.session.user.id}/${Date.now()}.${fileExt}`;
-        const { error: uploadError } = await supabase.storage
-          .from('grievance-files')
-          .upload(fileName, file);
-        if (uploadError) throw new Error('File upload failed: ' + uploadError.message);
-        fileUrl = `${process.env.NEXT_PUBLIC_SUPABASE_URL}/storage/v1/object/public/grievance-files/${fileName}`;
+        console.log('Starting file upload process...');
+        fileUrl = await uploadFileToSupabase(file, 'grievance-files', userId || 'anonymous');
+        if (!fileUrl) {
+          console.error('File upload returned null');
+          throw new Error('Failed to upload file. Please try again later.');
+        }
+        console.log('File uploaded successfully:', fileUrl);
       }
 
+      let translatedText = '';
+      if (formData.language === 'Tamil') {
+        let toTranslate = formData.description;
+        if (documentAnalysis?.extractedText) {
+          toTranslate += '\n' + documentAnalysis.extractedText;
+        }
+        translatedText = await translateTamilToEnglish(toTranslate);
+      }
+
+      // Send description and document content to FastAPI for priority classification
+      let finalPriority = 'Medium';
+      try {
+        console.log('Sending to FastAPI:', {
+          description: formData.description,
+          document_text: documentAnalysis?.extractedText || '',
+        });
+        finalPriority = await analyzePriority({
+          description: formData.description,
+          document_text: documentAnalysis?.extractedText || '',
+        });
+        console.log('Received priority from FastAPI:', finalPriority);
+      } catch (error) {
+        console.error('Error analyzing priority on submit:', error);
+        finalPriority = 'Medium';
+      }
+
+      // Insert grievance into Supabase with the AI-assigned priority
       const { error: insertError } = await supabase.from('grievances').insert([
         {
           title: formData.title,
@@ -104,11 +185,12 @@ export default function GrievanceSubmissionForm() {
           language: formData.language,
           category_id: formData.category_id,
           location: formData.location,
-          priority: formData.priority,
+          priority: finalPriority,
           status: 'Pending' as 'Pending' | 'In Progress' | 'Resolved' | 'Closed',
-          user_id: formData.isAnonymous ? null : sessionData.session.user.id,
+          user_id: formData.isAnonymous ? null : userId,
           file_url: fileUrl,
           assigned_employee_id: null,
+          translated_text: translatedText,
         },
       ]);
 
@@ -125,6 +207,7 @@ export default function GrievanceSubmissionForm() {
         isAnonymous: false,
       });
       setFile(null);
+      setDocumentAnalysis(null);
       if (fileInputRef.current) fileInputRef.current.value = '';
     } catch (error: any) {
       console.error('Error submitting grievance:', error);
@@ -169,7 +252,28 @@ export default function GrievanceSubmissionForm() {
                 rows={4}
                 className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-200"
                 value={formData.description}
-                onChange={(e) => setFormData({ ...formData, description: e.target.value })}
+                onChange={handleDescriptionChange}
+              />
+              <p className="mt-1 text-sm text-gray-500">
+                Priority will be automatically assigned by AI upon submission based on your description and uploaded document.
+              </p>
+            </div>
+            <div>
+              <label htmlFor="priority" className="block text-sm font-medium text-gray-700 mb-2">
+                Priority (AI-Assigned on Submit)
+              </label>
+              <input
+                type="text"
+                id="priority"
+                readOnly
+                className={`w-full p-3 border border-gray-300 rounded-lg bg-gray-100 capitalize ${
+                  formData.priority === 'High'
+                    ? 'text-red-600'
+                    : formData.priority === 'Medium'
+                    ? 'text-orange-600'
+                    : 'text-gray-600'
+                }`}
+                value={formData.priority}
               />
             </div>
             <div>
@@ -218,21 +322,6 @@ export default function GrievanceSubmissionForm() {
               </select>
             </div>
             <div>
-              <label htmlFor="priority" className="block text-sm font-medium text-gray-700 mb-2">
-                Priority
-              </label>
-              <select
-                id="priority"
-                className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-all duration-200"
-                value={formData.priority}
-                onChange={(e) => setFormData({ ...formData, priority: e.target.value as 'Low' | 'Medium' | 'High' })}
-              >
-                <option value="Low">Low</option>
-                <option value="Medium">Medium</option>
-                <option value="High">High</option>
-              </select>
-            </div>
-            <div>
               <label className="block text-sm font-medium text-gray-700 mb-2">
                 Upload Document (Optional)
               </label>
@@ -253,14 +342,22 @@ export default function GrievanceSubmissionForm() {
                       type="file"
                       ref={fileInputRef}
                       className="sr-only"
-                      accept=".pdf,image/*"
+                      accept=".pdf,.docx,.doc,.jpg,.jpeg,.png,.txt"
                       onChange={handleFileChange}
-                      disabled={isSubmitting}
+                      disabled={isSubmitting || isAnalyzing}
                     />
                   </label>
                   <p className="pl-1 text-sm text-gray-600">or drag and drop</p>
-                  <p className="text-xs text-gray-500">PDF or image up to 5MB</p>
+                  <p className="text-xs text-gray-500">
+                    PDF, Word, images (JPG/PNG), or text files up to 5MB
+                  </p>
                   {fileError && <p className="text-sm text-red-600">{fileError}</p>}
+                  {isAnalyzing && (
+                    <div className="flex items-center justify-center space-x-2">
+                      <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-indigo-600"></div>
+                      <p className="text-sm text-indigo-600">Analyzing document...</p>
+                    </div>
+                  )}
                   {file && (
                     <div className="mt-2 flex items-center justify-center">
                       <span className="text-sm text-gray-600">{file.name}</span>
@@ -275,6 +372,41 @@ export default function GrievanceSubmissionForm() {
                   )}
                 </div>
               </div>
+              {documentAnalysis && (
+                <div className="mt-4 p-4 bg-gray-50 rounded-lg space-y-3">
+                  <h4 className="font-medium text-gray-700 mb-2">Document Analysis</h4>
+                  <div className="space-y-2">
+                    <p className="text-sm text-gray-600">
+                      <span className="font-medium">Summary:</span> {documentAnalysis.summary}
+                    </p>
+                    <p className="text-sm text-gray-600">
+                      <span className="font-medium">Keywords:</span> {documentAnalysis.keywords.join(', ')}
+                    </p>
+                    <p className="text-sm text-gray-600">
+                      <span className="font-medium">Sentiment:</span>{' '}
+                      <span
+                        className={`capitalize ${
+                          documentAnalysis.sentiment === 'positive'
+                            ? 'text-green-600'
+                            : documentAnalysis.sentiment === 'negative'
+                            ? 'text-red-600'
+                            : 'text-gray-600'
+                        }`}
+                      >
+                        {documentAnalysis.sentiment}
+                      </span>
+                    </p>
+                    <div className="mt-3">
+                      <p className="text-sm font-medium text-gray-700 mb-1">Extracted Text:</p>
+                      <div className="max-h-40 overflow-y-auto p-2 bg-white rounded border border-gray-200">
+                        <p className="text-xs text-gray-600 whitespace-pre-wrap">
+                          {documentAnalysis.extractedText}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
             <div className="flex items-center">
               <input
@@ -295,9 +427,7 @@ export default function GrievanceSubmissionForm() {
               type="submit"
               disabled={isSubmitting}
               className={`w-full py-3 px-4 rounded-lg text-white font-semibold ${
-                isSubmitting
-                  ? 'bg-indigo-400 cursor-not-allowed'
-                  : 'bg-indigo-600 hover:bg-indigo-700'
+                isSubmitting ? 'bg-indigo-400 cursor-not-allowed' : 'bg-indigo-600 hover:bg-indigo-700'
               } transition-all duration-300`}
             >
               {isSubmitting ? 'Submitting...' : 'Submit Grievance'}
