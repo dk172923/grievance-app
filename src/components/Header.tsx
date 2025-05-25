@@ -112,14 +112,12 @@ export default function Header({ role }: HeaderProps) {
               Home
             </button>
           </Link>
-          {role === 'employee' && (
-            <Link href="/dashboard/employee/profile">
-              <button className="flex items-center px-4 py-2 bg-blue-700 rounded-lg hover:bg-blue-800 transition-all duration-300 cursor-pointer">
-                <UserIcon className="h-5 w-5 mr-2" />
-                Profile
-              </button>
-            </Link>
-          )}
+          <Link href={`/dashboard/${role}/profile`}>
+            <button className="flex items-center px-4 py-2 bg-blue-700 rounded-lg hover:bg-blue-800 transition-all duration-300 cursor-pointer">
+              <UserIcon className="h-5 w-5 mr-2" />
+              Profile
+            </button>
+          </Link>
           <div className="relative">
             <button onClick={toggleNotifications} className="relative">
               <BellIcon className="h-8 w-8 text-white hover:text-gray-200 transition-all duration-300 cursor-pointer" />

@@ -131,6 +131,17 @@ export default function ClientSignUpForm() {
                   />
                   <span className="text-gray-700 font-medium">Employee</span>
                 </label>
+                {/* <label className="flex items-center">
+                  <input
+                    type="radio"
+                    value="admin"
+                    checked={role === 'admin'}
+                    onChange={(e) => setRole(e.target.value)}
+                    className="mr-2 accent-blue-600"
+                    required
+                  />
+                  <span className="text-gray-700 font-medium">Admin</span>
+                </label> */}
               </div>
             </div>
             {error && <p className="text-red-500 text-sm mb-4">{error}</p>}

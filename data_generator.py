@@ -97,7 +97,7 @@ def generate_text(templates):
         brand=fake.company()
     )
 
-def generate_dataset(records_per_category=100_000):
+def generate_dataset(records_per_category=50):
     data = []
     for category, templates in tqdm(categories.items(), desc="Generating data"):
         for _ in range(records_per_category):
@@ -109,4 +109,4 @@ def generate_dataset(records_per_category=100_000):
 # Generate and save to CSV
 df = generate_dataset()
 df.to_csv("grievance_dataset_generated.csv", index=False, header=True, quoting=csv.QUOTE_ALL)
-print("✅ Done! Saved 1.5 million grievances to 'grievance_dataset.csv'")
+print("✅ Done! Saved 1.5k million grievances to 'grievance_dataset_generated.csv'")

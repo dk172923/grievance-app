@@ -40,14 +40,19 @@ interface Grievance {
   created_at: string;
   user_id: string;
   assigned_employee_id?: string;
-  categories: { name: string };
+  categories: { id: number; name: string };
   profiles?: { name: string; designation: string; location: string; email: string };
   submitter?: { id: string; email: string };
   assigned_by?: { name: string; designation: string };
   hierarchy?: TreeNode;
   actions?: GrievanceAction[];
-  ai_keywords?: string[];
   documents?: Document[];
+}
+
+interface SuggestedAction {
+  action: string;
+  count: number;
+  recentDate: string;
 }
 
 export default function GrievanceDetail() {
@@ -60,7 +65,7 @@ export default function GrievanceDetail() {
   const [error, setError] = useState<string | null>(null);
   const [actionInput, setActionInput] = useState('');
   const [statusInput, setStatusInput] = useState('Pending');
-  const [recommendations, setRecommendations] = useState<any[]>([]);
+  const [suggestedActions, setSuggestedActions] = useState<SuggestedAction[]>([]);
   const [recLoading, setRecLoading] = useState(false);
 
   useEffect(() => {
@@ -91,7 +96,7 @@ export default function GrievanceDetail() {
             created_at,
             user_id,
             assigned_employee_id,
-            categories!category_id (name),
+            category_id,
             profiles!grievances_assigned_employee_id_fkey (name, designation, location, email),
             submitter:profiles!grievances_user_id_fkey1 (id, email),
             grievance_delegations!grievance_id (
@@ -105,15 +110,24 @@ export default function GrievanceDetail() {
               action_text,
               created_at,
               employee:profiles!grievance_actions_employee_id_fkey (name, designation)
-            ),
-            ai_keywords
+            )
           `)
           .eq('id', id)
           .single();
 
         if (grievanceError) throw grievanceError;
 
-        // Fetch documents from Supabase storage
+        // Fetch category details
+        const { data: categoryData, error: categoryError } = await supabase
+          .from('categories')
+          .select('id, name')
+          .eq('id', grievanceData.category_id)
+          .single();
+
+        if (categoryError) throw categoryError;
+
+        grievanceData.categories = categoryData;
+
         const { data: files, error: storageError } = await supabase.storage
           .from('grievance-documents')
           .list(`grievance-${id}`);
@@ -189,7 +203,6 @@ export default function GrievanceDetail() {
             : undefined,
           hierarchy,
           actions,
-          ai_keywords: grievanceData.ai_keywords || [],
           documents,
         });
 
@@ -204,7 +217,7 @@ export default function GrievanceDetail() {
         if (employeesError) throw employeesError;
         setEmployees(employeesData || []);
 
-        fetchRecommendations(grievanceData);
+        fetchSuggestedActions(grievanceData);
       } catch (error: any) {
         console.error('Error fetching grievance:', error);
         setError(error.message || 'Failed to load grievance.');
@@ -216,38 +229,237 @@ export default function GrievanceDetail() {
     fetchGrievance();
   }, [id]);
 
-  const fetchRecommendations = async (grievance: any) => {
+  const fetchSuggestedActions = async (grievance: any) => {
     setRecLoading(true);
     try {
-      let query = supabase
-        .from('grievances')
-        .select(`id, title, description, translated_text, ai_keywords, status, priority, created_at, grievance_actions!grievance_id (action_text, created_at)`)
-        .neq('id', id)
-        .eq('category_id', grievance.categories.id)
-        .order('created_at', { ascending: false })
-        .limit(20);
+      // Check cache
+      const { data: cachedActions, error: cacheError } = await supabase
+        .from('grievance_suggested_actions')
+        .select('suggested_actions')
+        .eq('grievance_id', id)
+        .single();
 
-      const { data, error } = await query;
+      if (cacheError && cacheError.code !== 'PGRST116') throw cacheError;
+
+      if (cachedActions) {
+        // Filter out unwanted actions from cache
+        const filteredCachedActions = cachedActions.suggested_actions.filter(
+          (a: SuggestedAction) => !a.action.toLowerCase().includes('grievance reopened by user')
+        );
+        setSuggestedActions(filteredCachedActions);
+        setRecLoading(false);
+        return;
+      }
+
+      // Ensure category ID exists
+      const categoryId = grievance.categories?.id;
+      if (!categoryId) {
+        throw new Error('Grievance category ID is missing.');
+      }
+
+      // Fetch grievances in same category
+      const { data, error } = await supabase
+        .from('grievances')
+        .select(`
+          id,
+          description,
+          status,
+          priority,
+          created_at,
+          category_id,
+          grievance_actions!grievance_id (action_text, created_at)
+        `)
+        .neq('id', id)
+        .eq('category_id', categoryId)
+        .in('status', ['In Progress', 'Resolved'])
+        .order('created_at', { ascending: false })
+        .limit(50);
+
       if (error) throw error;
 
-      const currentKeywords = (grievance.ai_keywords || []).map((k: string) => k.toLowerCase());
-      const scored = (data || []).map((g: any) => {
-        const gKeywords = (g.ai_keywords || []).map((k: string) => k.toLowerCase());
-        const overlap = currentKeywords.filter((k: string) => gKeywords.includes(k)).length;
-        const textA = (grievance.translated_text || grievance.description || '').toLowerCase();
-        const textB = (g.translated_text || g.description || '').toLowerCase();
-        const setA = new Set(textA.split(/\W+/));
-        const setB = new Set(textB.split(/\W+/));
-        const intersection = new Set([...setA].filter(x => setB.has(x)));
-        const union = new Set([...setA, ...setB]);
-        const jaccard = union.size ? intersection.size / union.size : 0;
-        return { ...g, overlap, jaccard };
+      console.log('Fetched grievances:', data); // Debug log
+
+      if (!data || data.length === 0) {
+        // Fallback: Fetch recent actions from same category
+        const sixMonthsAgo = new Date();
+        sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+        const { data: recentActions, error: recentError } = await supabase
+          .from('grievance_actions')
+          .select('action_text, created_at')
+          .in('grievance_id', (
+            await supabase
+              .from('grievances')
+              .select('id')
+              .eq('category_id', categoryId)
+              .gte('created_at', sixMonthsAgo.toISOString())
+          ).data?.map(g => g.id) || [])
+          .gte('created_at', sixMonthsAgo.toISOString())
+          .not('action_text', 'ilike', '%Grievance reopened by user%')
+          .order('created_at', { ascending: false })
+          .limit(5);
+
+        if (recentError) throw recentError;
+
+        console.log('Recent actions:', recentActions); // Debug log
+
+        const actionFreq: Record<string, { count: number; recentDate: string }> = {};
+        (recentActions || []).forEach(a => {
+          const text = a.action_text.trim();
+          if (!actionFreq[text]) {
+            actionFreq[text] = { count: 0, recentDate: a.created_at };
+          }
+          actionFreq[text].count += 1;
+          if (new Date(a.created_at) > new Date(actionFreq[text].recentDate)) {
+            actionFreq[text].recentDate = a.created_at;
+          }
+        });
+
+        const uniqueActions = Object.entries(actionFreq)
+          .map(([text, { count, recentDate }]) => ({
+            action: text,
+            count,
+            recentDate,
+          }))
+          .filter(a => a.action.length > 10)
+          .sort((a, b) => b.count - a.count || new Date(b.recentDate).getTime() - new Date(a.recentDate).getTime())
+          .slice(0, 5);
+
+        if (uniqueActions.length > 0) {
+          await supabase
+            .from('grievance_suggested_actions')
+            .insert({
+              grievance_id: id,
+              suggested_actions: uniqueActions,
+              created_at: new Date().toISOString(),
+            });
+        }
+
+        setSuggestedActions(uniqueActions);
+        setRecLoading(false);
+        return;
+      }
+
+      // Compute cosine similarity
+      const currentText = (grievance.description || '').toLowerCase();
+      const stopwords = ['the', 'a', 'an', 'at', 'in', 'on', 'for', 'to', 'of', 'and', 'is', 'are', 'has', 'have', 'like', 'most'];
+      const scored = data.map((g: any) => {
+        const gText = (g.description || '').toLowerCase();
+        const textA = currentText.split(/\W+/).filter(w => w.length > 2 && !stopwords.includes(w));
+        const textB = gText.split(/\W+/).filter(w => w.length > 2 && !stopwords.includes(w));
+        const allWords = [...new Set([...textA, ...textB])];
+        const vecA = allWords.map(w => textA.includes(w) ? 1 : 0);
+        const vecB = allWords.map(w => textB.includes(w) ? 1 : 0);
+        const dotProduct = vecA.reduce((sum, a, i) => sum + a * vecB[i], 0);
+        const normA = Math.sqrt(vecA.reduce((sum, a) => sum + a * a, 0));
+        const normB = Math.sqrt(vecB.reduce((sum, b) => sum + b * b, 0));
+        const cosineSimilarity = (normA && normB) ? dotProduct / (normA * normB) : 0;
+
+        return {
+          ...g,
+          similarityScore: cosineSimilarity,
+          actions: (g.grievance_actions || [])
+            .filter((a: any) => !a.action_text.toLowerCase().includes('grievance reopened by user'))
+            .map((a: any) => ({
+              action_text: a.action_text,
+              created_at: a.created_at,
+            })),
+        };
       });
 
-      scored.sort((a, b) => b.overlap - a.overlap || b.jaccard - a.jaccard);
-      setRecommendations(scored.slice(0, 5));
+      console.log('Scored grievances:', scored); // Debug log
+
+      // Filter and sort
+      const filtered = scored
+        .filter(g => {
+          const gText = (g.description || '').toLowerCase();
+          const textA = currentText.split(/\W+/).filter(w => w.length > 2 && !stopwords.includes(w));
+          const textB = gText.split(/\W+/).filter(w => w.length > 2 && !stopwords.includes(w));
+          const commonWords = textA.filter(w => textB.includes(w)).length;
+          return g.similarityScore > 0.3 && g.actions && g.actions.length > 0 && commonWords >= 1;
+        })
+        .sort((a, b) => b.similarityScore - a.similarityScore)
+        .slice(0, 5);
+
+      console.log('Filtered grievances:', filtered); // Debug log
+
+      // Aggregate actions
+      const actionFreq: Record<string, { count: number; recentDate: string }> = {};
+      const sixMonthsAgo = new Date();
+      sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+
+      if (filtered.length > 0) {
+        filtered.forEach(g => {
+          g.actions.forEach((a: any) => {
+            const text = a.action_text.trim();
+            if (!actionFreq[text]) {
+              actionFreq[text] = { count: 0, recentDate: a.created_at };
+            }
+            actionFreq[text].count += 1;
+            if (new Date(a.created_at) > new Date(actionFreq[text].recentDate)) {
+              actionFreq[text].recentDate = a.created_at;
+            }
+          });
+        });
+      } else {
+        // Fallback: Fetch recent actions
+        const { data: recentActions, error: recentError } = await supabase
+          .from('grievance_actions')
+          .select('action_text, created_at')
+          .in('grievance_id', (
+            await supabase
+              .from('grievances')
+              .select('id')
+              .eq('category_id', categoryId)
+              .gte('created_at', sixMonthsAgo.toISOString())
+          ).data?.map(g => g.id) || [])
+          .gte('created_at', sixMonthsAgo.toISOString())
+          .not('action_text', 'ilike', '%Grievance reopened by user%')
+          .order('created_at', { ascending: false })
+          .limit(5);
+
+        if (recentError) throw recentError;
+
+        console.log('Fallback recent actions:', recentActions); // Debug log
+
+        (recentActions || []).forEach(a => {
+          const text = a.action_text.trim();
+          if (!actionFreq[text]) {
+            actionFreq[text] = { count: 0, recentDate: a.created_at };
+          }
+          actionFreq[text].count += 1;
+          if (new Date(a.created_at) > new Date(actionFreq[text].recentDate)) {
+            actionFreq[text].recentDate = a.created_at;
+          }
+        });
+      }
+
+      const uniqueActions = Object.entries(actionFreq)
+        .map(([text, { count, recentDate }]) => ({
+          action: text,
+          count,
+          recentDate,
+        }))
+        .filter(a => a.action.length > 10 && new Date(a.recentDate) > sixMonthsAgo)
+        .sort((a, b) => b.count - a.count || new Date(b.recentDate).getTime() - new Date(a.recentDate).getTime())
+        .slice(0, 5);
+
+      console.log('Unique actions:', uniqueActions); // Debug log
+
+      // Cache actions
+      if (uniqueActions.length > 0) {
+        await supabase
+          .from('grievance_suggested_actions')
+          .insert({
+            grievance_id: id,
+            suggested_actions: uniqueActions,
+            created_at: new Date().toISOString(),
+          });
+      }
+
+      setSuggestedActions(uniqueActions);
     } catch (err) {
-      setRecommendations([]);
+      console.error('Error fetching suggested actions:', err);
+      setSuggestedActions([]);
     } finally {
       setRecLoading(false);
     }
@@ -444,6 +656,163 @@ export default function GrievanceDetail() {
     } catch (error: any) {
       console.error('Error submitting action:', error);
       setError(error.message || 'Failed to submit action.');
+    }
+  };
+
+  const fetchGrievance = async () => {
+    try {
+      setLoading(true);
+      const sessionResponse = await supabase.auth.getSession();
+      const session = sessionResponse.data.session;
+      if (!session) throw new Error('User not authenticated.');
+
+      const { data: profileData, error: profileError } = await supabase
+        .from('profiles')
+        .select('id, category_id, designation, name, email')
+        .eq('id', session.user.id)
+        .single();
+
+      if (profileError || !profileData) throw new Error('Profile not found.');
+      setProfile(profileData);
+
+      const { data: grievanceData, error: grievanceError } = await supabase
+        .from('grievances')
+        .select(`
+          id,
+          title,
+          description,
+          status,
+          priority,
+          created_at,
+          user_id,
+          assigned_employee_id,
+          category_id,
+          profiles!grievances_assigned_employee_id_fkey (name, designation, location, email),
+          submitter:profiles!grievances_user_id_fkey1 (id, email),
+          grievance_delegations!grievance_id (
+            from_employee_id,
+            to_employee_id,
+            from_profile:from_employee_id (name, designation),
+            to_profile:to_employee_id (name, designation)
+          ),
+          grievance_actions!grievance_id (
+            id,
+            action_text,
+            created_at,
+            employee:profiles!grievance_actions_employee_id_fkey (name, designation)
+          )
+        `)
+        .eq('id', id)
+        .single();
+
+      if (grievanceError) throw grievanceError;
+
+      // Fetch category details
+      const { data: categoryData, error: categoryError } = await supabase
+        .from('categories')
+        .select('id, name')
+        .eq('id', grievanceData.category_id)
+        .single();
+
+      if (categoryError) throw categoryError;
+
+      grievanceData.categories = categoryData;
+
+      const { data: files, error: storageError } = await supabase.storage
+        .from('grievance-documents')
+        .list(`grievance-${id}`);
+
+      if (storageError) throw storageError;
+
+      const documents = files?.map(file => ({
+        name: file.name,
+        url: supabase.storage.from('grievance-documents').getPublicUrl(`grievance-${id}/${file.name}`).data.publicUrl,
+      })) || [];
+
+      let hierarchy: TreeNode = { name: 'Unassigned', designation: '', children: [] };
+      const delegations = Array.isArray(grievanceData.grievance_delegations) ? grievanceData.grievance_delegations : [];
+
+      if (delegations.length > 0) {
+        const employeeMap = new Map<string, TreeNode>();
+        delegations.forEach((d: any) => {
+          if (d.from_employee_id && d.from_profile) {
+            employeeMap.set(d.from_employee_id, {
+              name: d.from_profile.name,
+              designation: d.from_profile.designation,
+              children: [],
+            });
+          }
+          if (d.to_employee_id && d.to_profile) {
+            employeeMap.set(d.to_employee_id, {
+              name: d.to_profile.name,
+              designation: d.to_profile.designation,
+              children: [],
+            });
+          }
+        });
+
+        delegations.forEach((d: any) => {
+          const fromNode = d.from_employee_id ? employeeMap.get(d.from_employee_id) : null;
+          const toNode = d.to_employee_id ? employeeMap.get(d.to_employee_id) : null;
+          if (fromNode && toNode) {
+            fromNode.children = fromNode.children || [];
+            if (!fromNode.children.some(child => child.name === toNode.name)) {
+              fromNode.children.push(toNode);
+            }
+          }
+        });
+
+        const firstDelegation = delegations[0];
+        if (firstDelegation.from_employee_id) {
+          hierarchy = employeeMap.get(firstDelegation.from_employee_id) || hierarchy;
+        }
+      } else if (grievanceData.profiles) {
+        hierarchy = { name: grievanceData.profiles.name, designation: grievanceData.profiles.designation, children: [] };
+      }
+
+      const actions = Array.isArray(grievanceData.grievance_actions)
+        ? grievanceData.grievance_actions
+            .map((a: any) => ({
+              id: a.id,
+              action_text: a.action_text,
+              created_at: a.created_at,
+              employee: a.employee,
+            }))
+            .sort((a: GrievanceAction, b: GrievanceAction) =>
+              new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+            )
+        : [];
+
+      setGrievance({
+        ...grievanceData,
+        categories: Array.isArray(grievanceData.categories) ? grievanceData.categories[0] : grievanceData.categories,
+        profiles: Array.isArray(grievanceData.profiles) ? grievanceData.profiles[0] : grievanceData.profiles,
+        submitter: Array.isArray(grievanceData.submitter) ? grievanceData.submitter[0] : grievanceData.submitter,
+        assigned_by: delegations[0]?.from_profile
+          ? { name: delegations[0].from_profile.name, designation: delegations[0].from_profile.designation }
+          : undefined,
+        hierarchy,
+        actions,
+        documents,
+      });
+
+      const { data: employeesData, error: employeesError } = await supabase
+        .from('profiles')
+        .select('id, name, designation')
+        .eq('category_id', profileData.category_id)
+        .eq('role', 'employee')
+        .neq('id', session.user.id)
+        .in('designation', profileData.designation === 'Lead' ? ['Senior', 'Junior'] : ['Junior']);
+
+      if (employeesError) throw employeesError;
+      setEmployees(employeesData || []);
+
+      fetchSuggestedActions(grievanceData);
+    } catch (error: any) {
+      console.error('Error fetching grievance:', error);
+      setError(error.message || 'Failed to load grievance.');
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -657,67 +1026,23 @@ export default function GrievanceDetail() {
             <div className="mt-6">
               <h3 className="text-xl font-semibold text-gray-800 mb-4">Suggested Actions</h3>
               {recLoading ? (
-                <p className="text-gray-600 text-sm animate-pulse">Loading recommendations...</p>
-              ) : recommendations.length === 0 ? (
-                <p className="text-gray-600 text-sm">No similar grievances found for recommendations.</p>
+                <p className="text-gray-600 text-sm animate-pulse">Loading suggested actions...</p>
+              ) : suggestedActions.length === 0 ? (
+                <p className="text-gray-600 text-sm">No suggested actions available.</p>
               ) : (
-                <div className="space-y-4">
-                  {recommendations.map((rec) => (
-                    <div key={rec.id} className="bg-gray-50 p-3 rounded-lg border border-gray-200">
-                      <div className="mb-1">
-                        <span className="font-semibold text-gray-700 text-sm">{rec.title}</span>
-                        <span className="ml-2 text-xs text-gray-500">
-                          ({new Date(rec.created_at).toLocaleDateString()})
+                <div className="p-4 bg-indigo-50 rounded-lg">
+                  <h4 className="font-semibold text-indigo-700 text-sm mb-2">Recommended Actions:</h4>
+                  <ul className="list-disc ml-4 text-indigo-700 text-sm">
+                    {suggestedActions.map((action, idx) => (
+                      <li key={idx} className="mb-1">
+                        {action.action}{' '}
+                        <span className="text-xs text-indigo-500">
+                          (Used {action.count} time{action.count !== 1 ? 's' : ''}, last on{' '}
+                          {new Date(action.recentDate).toLocaleDateString()})
                         </span>
-                      </div>
-                      <div className="mb-1 text-xs text-gray-600">
-                        {rec.translated_text || rec.description}
-                      </div>
-                      <div className="mb-1 text-xs">
-                        <span className="font-medium text-gray-700">Status:</span> {rec.status} |{' '}
-                        <span className="font-medium text-gray-700">Priority:</span> {rec.priority}
-                      </div>
-                      <div>
-                        <span className="font-medium text-gray-700 text-xs">Actions Taken:</span>
-                        {rec.grievance_actions && rec.grievance_actions.length > 0 ? (
-                          <ul className="list-disc ml-4 text-xs text-gray-700">
-                            {rec.grievance_actions.map((a: any, idx: number) => (
-                              <li key={idx}>
-                                {a.action_text}{' '}
-                                <span className="text-xs text-gray-400">
-                                  ({new Date(a.created_at).toLocaleDateString()})
-                                </span>
-                              </li>
-                            ))}
-                          </ul>
-                        ) : (
-                          <span className="ml-2 text-gray-500 text-xs">No actions recorded.</span>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                  <div className="p-3 bg-indigo-50 rounded-lg">
-                    <span className="font-semibold text-indigo-700 text-sm">Suggested Actions:</span>
-                    <ul className="list-disc ml-4 text-indigo-700 text-xs">
-                      {(() => {
-                        const allActions = recommendations.flatMap((r: any) =>
-                          (r.grievance_actions || []).map((a: any) => a.action_text)
-                        );
-                        const freq: Record<string, number> = {};
-                        allActions.forEach((a: string) => {
-                          freq[a] = (freq[a] || 0) + 1;
-                        });
-                        return Object.entries(freq)
-                          .sort((a, b) => b[1] - a[1])
-                          .slice(0, 3)
-                          .map(([action, count], idx) => (
-                            <li key={idx}>
-                              {action} <span className="text-xs">({count} times)</span>
-                            </li>
-                          ));
-                      })()}
-                    </ul>
-                  </div>
+                      </li>
+                    ))}
+                  </ul>
                 </div>
               )}
             </div>

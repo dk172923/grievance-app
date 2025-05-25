@@ -15,6 +15,11 @@
 !.yarn/releases
 !.yarn/versions
 
+# AI models 
+/logs
+/grievance_priority_model
+/__pycache__
+
 # testing
 /coverage
 

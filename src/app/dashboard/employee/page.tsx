@@ -228,7 +228,7 @@ export default function EmployeeDashboard() {
             </p>
           </div>
 
-          <div className="w-full max-w-6xl mx-auto mt-8 mb-8">
+          {/* <div className="w-full max-w-6xl mx-auto mt-8 mb-8">
             <div className="bg-white rounded-lg shadow-md p-6">
               <h2 className="text-2xl font-semibold mb-4 text-gray-800">Data Analysis</h2>
               <p className="mb-4 text-gray-600">Access our data visualization tools to identify problem hotspots and trends using our K-means clustering analysis.</p>
@@ -239,7 +239,7 @@ export default function EmployeeDashboard() {
                 <span className="mr-2">📊</span> View Problem Hotspots
               </a>
             </div>
-          </div>
+          </div> */}
 
           <div className="flex justify-between items-center mb-6">
             <div className="flex items-center space-x-4">
