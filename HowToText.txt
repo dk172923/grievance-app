@@ -1,0 +1,12 @@
+1. Go into the /grievance-app and change env file to .env.local
+2. Open 1st terminal 
+    2.1 Start the Next.js application by running "npm install && npm run dev"
+3. Open 2nd terminal 
+    3.1 Run pip install command to install python libraries "Refer pip install.txt"
+    3.2 Run Python Server by running "uvicorn server:app --host 0.0.0.0 --port 8000"
+4. Open 3rd terminal (Optional)
+    4.1 Run model training by running "python train-model.py"
+5. Open 4th terminal
+    5.1 Go to smart-contract and run "npx hardhat run scripts/deploy.js --network ganache" to get contract address paste that in src/utils/contract.js
+6. Open 5th terminal 
+    6.1 Run "npx ganache --port 7545 --chain.chainId 1337 --db ./ganache-data --accounts 10 --defaultBalanceEther 1000000" to start the local ganache blockchain
