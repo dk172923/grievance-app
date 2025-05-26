@@ -4,6 +4,8 @@ import { useState, useEffect } from 'react';
 import { supabase } from '../../../lib/supabase';
 import ProtectedRoute from '../../../components/ProtectedRoute';
 import { PencilIcon, NoSymbolIcon, CheckCircleIcon } from '@heroicons/react/24/outline';
+import { ethers } from 'ethers';
+import { getContract } from '../../../utils/contract';
 
 interface Profile {
   id: string;
@@ -42,6 +44,7 @@ interface Grievance {
   ai_summary: string | null;
   ai_sentiment: string | null;
   translated_text: string | null;
+  blockchain_hash: string | null;
 }
 
 interface Action {
@@ -74,6 +77,8 @@ export default function AdminDashboard() {
   const [viewGrievance, setViewGrievance] = useState<Grievance | null>(null);
   const [grievanceActions, setGrievanceActions] = useState<Action[]>([]);
   const [showViewModal, setShowViewModal] = useState(false);
+  const [verifyResult, setVerifyResult] = useState<string | null>(null);
+  const [contract, setContract] = useState<any>(null);
   const [filterState, setFilterState] = useState<FilterState>({
     title: '',
     location: '',
@@ -83,45 +88,58 @@ export default function AdminDashboard() {
   });
 
   useEffect(() => {
-    fetchData();
+    const init = async () => {
+      try {
+        const _contract = await getContract();
+        if (!_contract.verifyHash) {
+          throw new Error('Contract missing verifyHash function');
+        }
+        setContract(_contract);
+        await fetchData();
+      } catch (err: any) {
+        console.error('Initialization error:', err);
+        setError('Failed to initialize blockchain connection: ' + err.message);
+      } finally {
+        setLoading(false);
+      }
+    };
+    init();
   }, []);
 
   async function fetchData() {
     setLoading(true);
     setError(null);
     try {
-      // Fetch users
-      const { data: userData, error: userError } = await supabase
-        .from('profiles')
-        .select('id, name, email, phone_number, address, banned, role')
-        .eq('role', 'user');
+      const [
+        { data: userData, error: userError },
+        { data: employeeData, error: employeeError },
+        { data: categoryData, error: categoryError },
+        { data: grievanceData, error: grievanceError },
+      ] = await Promise.all([
+        supabase
+          .from('profiles')
+          .select('id, name, email, phone_number, address, banned, role')
+          .eq('role', 'user'),
+        supabase
+          .from('profiles')
+          .select('id, name, email, category_id, designation, location, banned, role')
+          .eq('role', 'employee'),
+        supabase.from('categories').select('id, name').order('name'),
+        supabase
+          .from('grievances')
+          .select(`
+            id, user_id, title, description, language, category_id, location, priority, status,
+            file_url, created_at, updated_at, assigned_employee_id, blockchain_hash,
+            categories!category_id (name),
+            profiles!assigned_employee_id (name),
+            ai_summary, ai_sentiment, translated_text
+          `)
+          .order('created_at', { ascending: false }),
+      ]);
+
       if (userError) throw userError;
-
-      // Fetch employees
-      const { data: employeeData, error: employeeError } = await supabase
-        .from('profiles')
-        .select('id, name, email, category_id, designation, location, banned, role')
-        .eq('role', 'employee');
       if (employeeError) throw employeeError;
-
-      // Fetch categories
-      const { data: categoryData, error: categoryError } = await supabase
-        .from('categories')
-        .select('id, name')
-        .order('name');
       if (categoryError) throw categoryError;
-
-      // Fetch grievances
-      const { data: grievanceData, error: grievanceError } = await supabase
-        .from('grievances')
-        .select(`
-          id, user_id, title, description, language, category_id, location, priority, status,
-          file_url, created_at, updated_at, assigned_employee_id,
-          categories!category_id (name),
-          profiles!assigned_employee_id (name),
-          ai_summary, ai_sentiment, translated_text
-        `)
-        .order('created_at', { ascending: false });
       if (grievanceError) throw grievanceError;
 
       setUsers(userData || []);
@@ -138,9 +156,7 @@ export default function AdminDashboard() {
 
   async function handleLogout() {
     const { error } = await supabase.auth.signOut();
-    if (error) {
-      console.error('Logout error:', error.message);
-    }
+    if (error) console.error('Logout error:', error.message);
     router.push('/');
     router.refresh();
   }
@@ -191,7 +207,7 @@ export default function AdminDashboard() {
 
       setShowEditModal(false);
       setEditProfile(null);
-      fetchData();
+      await fetchData();
     } catch (error: any) {
       console.error('Error updating profile:', error);
       setError(error.message || 'Failed to update profile.');
@@ -210,7 +226,7 @@ export default function AdminDashboard() {
         .eq('id', profile.id);
       if (error) throw error;
 
-      fetchData();
+      await fetchData();
     } catch (error: any) {
       console.error(`Error ${action}ning user:`, error);
       setError(`Failed to ${action} user.`);
@@ -219,6 +235,7 @@ export default function AdminDashboard() {
 
   async function openViewModal(grievance: Grievance) {
     setViewGrievance(grievance);
+    setVerifyResult(null);
     setError(null);
     try {
       const { data: actionsData, error: actionsError } = await supabase
@@ -228,11 +245,83 @@ export default function AdminDashboard() {
         .order('created_at', { ascending: false });
       if (actionsError) throw actionsError;
       setGrievanceActions(actionsData || []);
+
+      if (!grievance.blockchain_hash) {
+        try {
+          const response = await fetch('/api/grievances/store-hash', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              grievanceId: grievance.id,
+              title: grievance.title,
+              description: grievance.description,
+              created_at: grievance.created_at,
+            }),
+          });
+          const result = await response.json();
+          if (result.error) throw new Error(result.error);
+          setGrievances(grievances.map(g => g.id === grievance.id ? { ...g, blockchain_hash: result.hash } : g));
+          setViewGrievance({ ...grievance, blockchain_hash: result.hash });
+        } catch (err: any) {
+          console.error('Store hash error:', err);
+          setError('Failed to store grievance hash: ' + err.message);
+        }
+      }
     } catch (error: any) {
       console.error('Error fetching actions:', error);
       setError(error.message || 'Failed to load grievance actions.');
     }
     setShowViewModal(true);
+  }
+
+  async function handleVerifyGrievance(grievance: Grievance) {
+    if (!contract) {
+      setVerifyResult('⚠️ Blockchain contract not initialized');
+      return;
+    }
+
+    if (typeof contract.verifyHash !== 'function') {
+      console.error('Contract object:', contract);
+      setVerifyResult('⚠️ Contract missing verifyHash function');
+      return;
+    }
+
+    try {
+      const { data: currentGrievance, error: fetchError } = await supabase
+        .from('grievances')
+        .select('id, title, description, created_at, blockchain_hash')
+        .eq('id', grievance.id)
+        .single();
+
+      if (fetchError || !currentGrievance) {
+        setVerifyResult('❌ Grievance not found in database');
+        return;
+      }
+
+      const dataString = `${currentGrievance.id}${currentGrievance.title}${currentGrievance.description}${currentGrievance.created_at}`;
+      const computedHash = ethers.keccak256(ethers.toUtf8Bytes(dataString));
+
+      if (!currentGrievance.blockchain_hash) {
+        setVerifyResult('❌ No blockchain hash stored for this grievance');
+        return;
+      }
+
+      const isValid = await contract.verifyHash(computedHash);
+      if (!isValid) {
+        setVerifyResult('❌ Grievance data has been tampered with');
+        return;
+      }
+
+      if (computedHash !== currentGrievance.blockchain_hash) {
+        setVerifyResult('❌ Hash mismatch');
+        return;
+      }
+
+      setVerifyResult('✅ Grievance is valid and untampered');
+    } catch (err: any) {
+      console.error('Verify error:', err);
+      setVerifyResult(`⚠️ Error verifying grievance: ${err.message}`);
+    }
   }
 
   function handleFilterChange(key: keyof FilterState, value: string) {
@@ -297,7 +386,6 @@ export default function AdminDashboard() {
             </div>
           ) : (
             <>
-              {/* Metrics */}
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-6 mb-8">
                 <div className="bg-white rounded-xl shadow-lg p-6 text-center animate-fade-in">
                   <h2 className="text-2xl font-semibold text-gray-800">Total Users</h2>
@@ -313,7 +401,6 @@ export default function AdminDashboard() {
                 </div>
               </div>
 
-              {/* Hotspots Link */}
               <div className="mb-8">
                 <a
                   href="/dashboard/admin/problem-hotspots"
@@ -323,7 +410,6 @@ export default function AdminDashboard() {
                 </a>
               </div>
 
-              {/* Users Table */}
               <div className="bg-white rounded-xl shadow-lg p-6 mb-8">
                 <h2 className="text-2xl font-semibold text-gray-900 mb-6">Users</h2>
                 {users.length === 0 ? (
@@ -379,7 +465,6 @@ export default function AdminDashboard() {
                 )}
               </div>
 
-              {/* Employees Table */}
               <div className="bg-white rounded-xl shadow-lg p-6 mb-8">
                 <h2 className="text-2xl font-semibold text-gray-900 mb-6">Employees</h2>
                 {employees.length === 0 ? (
@@ -439,10 +524,8 @@ export default function AdminDashboard() {
                 )}
               </div>
 
-              {/* Grievances Table */}
               <div className="bg-white rounded-xl shadow-lg p-6">
                 <h2 className="text-2xl font-semibold text-gray-900 mb-6">Grievances</h2>
-                {/* Filters */}
                 <div className="mb-6 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
                   <div>
                     <label htmlFor="filter-title" className="block text-sm font-medium text-gray-700">
@@ -531,7 +614,6 @@ export default function AdminDashboard() {
                   </button>
                 </div>
 
-                {/* Grievances Table */}
                 {filteredGrievances.length === 0 ? (
                   <p className="text-gray-600">No grievances found.</p>
                 ) : (
@@ -599,7 +681,6 @@ export default function AdminDashboard() {
                 )}
               </div>
 
-              {/* Edit Profile Modal */}
               {showEditModal && editProfile && (
                 <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
                   <div className="bg-white rounded-xl p-8 max-w-lg w-full">
@@ -616,7 +697,7 @@ export default function AdminDashboard() {
                           id="name"
                           value={editForm.name || ''}
                           onChange={e => setEditForm({ ...editForm, name: e.target.value })}
-                          className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-3"
+                          className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2"
                           required
                         />
                       </div>
@@ -629,7 +710,7 @@ export default function AdminDashboard() {
                           id="email"
                           value={editForm.email || ''}
                           onChange={e => setEditForm({ ...editForm, email: e.target.value })}
-                          className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-3"
+                          className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2"
                           required
                         />
                       </div>
@@ -644,7 +725,7 @@ export default function AdminDashboard() {
                               id="phone_number"
                               value={editForm.phone_number || ''}
                               onChange={e => setEditForm({ ...editForm, phone_number: e.target.value })}
-                              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-3"
+                              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2"
                             />
                           </div>
                           <div>
@@ -655,7 +736,7 @@ export default function AdminDashboard() {
                               id="address"
                               value={editForm.address || ''}
                               onChange={e => setEditForm({ ...editForm, address: e.target.value })}
-                              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-3"
+                              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2"
                             />
                           </div>
                         </>
@@ -670,7 +751,7 @@ export default function AdminDashboard() {
                               id="category_id"
                               value={editForm.category_id ?? ''}
                               onChange={e => setEditForm({ ...editForm, category_id: Number(e.target.value) || undefined })}
-                              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-3"
+                              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2"
                             >
                               <option value="">Select Department</option>
                               {categories.map(category => (
@@ -690,7 +771,7 @@ export default function AdminDashboard() {
                               onChange={e =>
                                 setEditForm({ ...editForm, designation: e.target.value as 'Lead' | 'Senior' | 'Junior' | undefined })
                               }
-                              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-3"
+                              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2"
                             >
                               <option value="">Select Designation</option>
                               <option value="Lead">Lead</option>
@@ -707,7 +788,7 @@ export default function AdminDashboard() {
                               id="location"
                               value={editForm.location || ''}
                               onChange={e => setEditForm({ ...editForm, location: e.target.value })}
-                              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-3"
+                              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2"
                             />
                           </div>
                         </>
@@ -732,7 +813,6 @@ export default function AdminDashboard() {
                 </div>
               )}
 
-              {/* View Grievance Modal */}
               {showViewModal && viewGrievance && (
                 <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
                   <div className="bg-white rounded-xl p-8 max-w-2xl w-full max-h-[80vh] overflow-y-auto">
@@ -823,6 +903,23 @@ export default function AdminDashboard() {
                         <div>
                           <span className="font-medium text-gray-700">Translated Text:</span>{' '}
                           {viewGrievance.translated_text}
+                        </div>
+                      )}
+                      <div>
+                        <span className="font-medium text-gray-700">Blockchain Hash:</span>{' '}
+                        {viewGrievance.blockchain_hash || 'Not yet stored'}
+                        {viewGrievance.blockchain_hash && (
+                          <button
+                            onClick={() => handleVerifyGrievance(viewGrievance)}
+                            className="ml-4 px-4 py-1 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                          >
+                            Verify
+                          </button>
+                        )}
+                      </div>
+                      {verifyResult && (
+                        <div className={`text-lg ${verifyResult.includes('✅') ? 'text-green-700' : 'text-red-700'}`}>
+                          <span className="font-medium text-gray-700">Verification Result:</span> {verifyResult}
                         </div>
                       )}
                       <div>

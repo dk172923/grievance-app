@@ -121,7 +121,7 @@ export default function GrievanceSubmissionForm() {
     setFormData({ ...formData, description: newDescription });
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
+const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSubmitting(true);
     setError(null);
@@ -160,7 +160,6 @@ export default function GrievanceSubmissionForm() {
         translatedText = await translateTamilToEnglish(toTranslate);
       }
 
-      // Send description and document content to FastAPI for priority classification
       let finalPriority = 'Medium';
       try {
         console.log('Sending to FastAPI:', {
@@ -177,24 +176,50 @@ export default function GrievanceSubmissionForm() {
         finalPriority = 'Medium';
       }
 
-      // Insert grievance into Supabase with the AI-assigned priority
-      const { error: insertError } = await supabase.from('grievances').insert([
-        {
-          title: formData.title,
-          description: formData.description,
-          language: formData.language,
-          category_id: formData.category_id,
-          location: formData.location,
-          priority: finalPriority,
-          status: 'Pending' as 'Pending' | 'In Progress' | 'Resolved' | 'Closed',
-          user_id: formData.isAnonymous ? null : userId,
-          file_url: fileUrl,
-          assigned_employee_id: null,
-          translated_text: translatedText,
-        },
-      ]);
+      // Insert grievance into Supabase
+      const { data: insertedGrievance, error: insertError } = await supabase
+        .from('grievances')
+        .insert([
+          {
+            title: formData.title,
+            description: formData.description,
+            language: formData.language,
+            category_id: formData.category_id,
+            location: formData.location,
+            priority: finalPriority,
+            status: 'Pending' as 'Pending' | 'In Progress' | 'Resolved' | 'Closed',
+            user_id: formData.isAnonymous ? null : userId,
+            file_url: fileUrl,
+            assigned_employee_id: null,
+            translated_text: translatedText,
+          },
+        ])
+        .select('id, created_at')
+        .single();
 
       if (insertError) throw new Error('Grievance submission failed: ' + insertError.message);
+      if (!insertedGrievance) throw new Error('Failed to retrieve inserted grievance details');
+
+      // Store blockchain hash
+      try {
+        const response = await fetch('/api/grievances/store-hash', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            grievanceId: insertedGrievance.id,
+            title: formData.title,
+            description: formData.description,
+            created_at: insertedGrievance.created_at,
+          }),
+        });
+        const result = await response.json();
+        if (result.error) throw new Error(result.error);
+        console.log('Blockchain hash stored:', result.hash);
+      } catch (err: any) {
+        console.error('Store hash error:', err);
+        setError('Grievance submitted, but failed to store blockchain hash: ' + err.message);
+        // Allow submission to complete despite hash error
+      }
 
       alert('Grievance submitted successfully!');
       setFormData({
