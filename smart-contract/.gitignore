@@ -1,0 +1,9 @@
+node_modules
+.env
+artifacts
+cache
+typechain
+typechain-types
+coverage
+coverage.json
+ignition
