@@ -47,6 +47,7 @@ interface Grievance {
   hierarchy?: TreeNode;
   actions?: GrievanceAction[];
   documents?: Document[];
+  grievance_resolved_file?: string;
 }
 
 interface SuggestedAction {
@@ -67,6 +68,7 @@ export default function GrievanceDetail() {
   const [statusInput, setStatusInput] = useState('Pending');
   const [suggestedActions, setSuggestedActions] = useState<SuggestedAction[]>([]);
   const [recLoading, setRecLoading] = useState(false);
+  const [resolvedFile, setResolvedFile] = useState<File | null>(null);
 
   useEffect(() => {
     const fetchGrievance = async () => {
@@ -97,6 +99,7 @@ export default function GrievanceDetail() {
             user_id,
             assigned_employee_id,
             category_id,
+            grievance_resolved_file,
             profiles!grievances_assigned_employee_id_fkey (name, designation, location, email),
             submitter:profiles!grievances_user_id_fkey1 (id, email),
             grievance_delegations!grievance_id (
@@ -117,7 +120,6 @@ export default function GrievanceDetail() {
 
         if (grievanceError) throw grievanceError;
 
-        // Fetch category details
         const { data: categoryData, error: categoryError } = await supabase
           .from('categories')
           .select('id, name')
@@ -232,7 +234,6 @@ export default function GrievanceDetail() {
   const fetchSuggestedActions = async (grievance: any) => {
     setRecLoading(true);
     try {
-      // Check cache
       const { data: cachedActions, error: cacheError } = await supabase
         .from('grievance_suggested_actions')
         .select('suggested_actions')
@@ -242,7 +243,6 @@ export default function GrievanceDetail() {
       if (cacheError && cacheError.code !== 'PGRST116') throw cacheError;
 
       if (cachedActions) {
-        // Filter out unwanted actions from cache
         const filteredCachedActions = cachedActions.suggested_actions.filter(
           (a: SuggestedAction) => !a.action.toLowerCase().includes('grievance reopened by user')
         );
@@ -251,13 +251,11 @@ export default function GrievanceDetail() {
         return;
       }
 
-      // Ensure category ID exists
       const categoryId = grievance.categories?.id;
       if (!categoryId) {
         throw new Error('Grievance category ID is missing.');
       }
 
-      // Fetch grievances in same category
       const { data, error } = await supabase
         .from('grievances')
         .select(`
@@ -277,10 +275,7 @@ export default function GrievanceDetail() {
 
       if (error) throw error;
 
-      console.log('Fetched grievances:', data); // Debug log
-
       if (!data || data.length === 0) {
-        // Fallback: Fetch recent actions from same category
         const sixMonthsAgo = new Date();
         sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
         const { data: recentActions, error: recentError } = await supabase
@@ -299,8 +294,6 @@ export default function GrievanceDetail() {
           .limit(5);
 
         if (recentError) throw recentError;
-
-        console.log('Recent actions:', recentActions); // Debug log
 
         const actionFreq: Record<string, { count: number; recentDate: string }> = {};
         (recentActions || []).forEach(a => {
@@ -339,7 +332,6 @@ export default function GrievanceDetail() {
         return;
       }
 
-      // Compute cosine similarity
       const currentText = (grievance.description || '').toLowerCase();
       const stopwords = ['the', 'a', 'an', 'at', 'in', 'on', 'for', 'to', 'of', 'and', 'is', 'are', 'has', 'have', 'like', 'most'];
       const scored = data.map((g: any) => {
@@ -366,9 +358,6 @@ export default function GrievanceDetail() {
         };
       });
 
-      console.log('Scored grievances:', scored); // Debug log
-
-      // Filter and sort
       const filtered = scored
         .filter(g => {
           const gText = (g.description || '').toLowerCase();
@@ -380,9 +369,6 @@ export default function GrievanceDetail() {
         .sort((a, b) => b.similarityScore - a.similarityScore)
         .slice(0, 5);
 
-      console.log('Filtered grievances:', filtered); // Debug log
-
-      // Aggregate actions
       const actionFreq: Record<string, { count: number; recentDate: string }> = {};
       const sixMonthsAgo = new Date();
       sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
@@ -401,7 +387,6 @@ export default function GrievanceDetail() {
           });
         });
       } else {
-        // Fallback: Fetch recent actions
         const { data: recentActions, error: recentError } = await supabase
           .from('grievance_actions')
           .select('action_text, created_at')
@@ -418,8 +403,6 @@ export default function GrievanceDetail() {
           .limit(5);
 
         if (recentError) throw recentError;
-
-        console.log('Fallback recent actions:', recentActions); // Debug log
 
         (recentActions || []).forEach(a => {
           const text = a.action_text.trim();
@@ -443,9 +426,6 @@ export default function GrievanceDetail() {
         .sort((a, b) => b.count - a.count || new Date(b.recentDate).getTime() - new Date(a.recentDate).getTime())
         .slice(0, 5);
 
-      console.log('Unique actions:', uniqueActions); // Debug log
-
-      // Cache actions
       if (uniqueActions.length > 0) {
         await supabase
           .from('grievance_suggested_actions')
@@ -631,9 +611,38 @@ export default function GrievanceDetail() {
 
       if (actionError) throw new Error(`Action insert failed: ${actionError.message}`);
 
+      let updateData: { status: string; updated_at: string; grievance_resolved_file?: string } = {
+        status: statusInput,
+        updated_at: new Date().toISOString(),
+      };
+
+      if (statusInput === 'Resolved' && resolvedFile) {
+        if (!resolvedFile) throw new Error('Resolution file is required when marking as Resolved.');
+        
+        const fileExt = resolvedFile.name.split('.').pop();
+        const fileName = `resolution-${id}-${Date.now()}.${fileExt}`;
+        const filePath = `grievance-${id}/${fileName}`;
+
+        const { error: uploadError } = await supabase.storage
+          .from('grievance-documents')
+          .upload(filePath, resolvedFile);
+
+        if (uploadError) throw new Error(`File upload failed: ${uploadError.message}`);
+
+        const { data: publicUrlData } = supabase.storage
+          .from('grievance-documents')
+          .getPublicUrl(filePath);
+
+        if (!publicUrlData) throw new Error('Failed to get public URL for uploaded file.');
+
+        updateData.grievance_resolved_file = publicUrlData.publicUrl;
+      } else if (statusInput === 'Resolved' && !resolvedFile) {
+        throw new Error('A resolution file must be provided when marking as Resolved.');
+      }
+
       const { error: statusError } = await supabase
         .from('grievances')
-        .update({ status: statusInput, updated_at: new Date().toISOString() })
+        .update(updateData)
         .eq('id', id)
         .eq('assigned_employee_id', session.user.id);
 
@@ -652,6 +661,7 @@ export default function GrievanceDetail() {
       alert('Action added successfully!');
       setActionInput('');
       setStatusInput('Pending');
+      setResolvedFile(null);
       fetchGrievance();
     } catch (error: any) {
       console.error('Error submitting action:', error);
@@ -687,6 +697,7 @@ export default function GrievanceDetail() {
           user_id,
           assigned_employee_id,
           category_id,
+          grievance_resolved_file,
           profiles!grievances_assigned_employee_id_fkey (name, designation, location, email),
           submitter:profiles!grievances_user_id_fkey1 (id, email),
           grievance_delegations!grievance_id (
@@ -707,7 +718,6 @@ export default function GrievanceDetail() {
 
       if (grievanceError) throw grievanceError;
 
-      // Fetch category details
       const { data: categoryData, error: categoryError } = await supabase
         .from('categories')
         .select('id, name')
@@ -925,6 +935,19 @@ export default function GrievanceDetail() {
                   </ul>
                 </div>
               )}
+              {grievance.grievance_resolved_file && (
+                <div>
+                  <span className="font-medium text-gray-600">Resolution Document:</span>
+                  <a
+                    href={grievance.grievance_resolved_file}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-indigo-600 hover:text-indigo-800 ml-2"
+                  >
+                    View Resolution Document
+                  </a>
+                </div>
+              )}
             </div>
 
             <div className="mt-6">
@@ -966,6 +989,19 @@ export default function GrievanceDetail() {
                   <option value="In Progress">In Progress</option>
                   <option value="Resolved">Resolved</option>
                 </select>
+                {statusInput === 'Resolved' && (
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      Upload Resolution Document
+                    </label>
+                    <input
+                      type="file"
+                      onChange={(e) => setResolvedFile(e.target.files ? e.target.files[0] : null)}
+                      className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
+                      accept=".pdf,.doc,.docx"
+                    />
+                  </div>
+                )}
                 <button
                   onClick={handleActionSubmit}
                   className="w-full p-3 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-all duration-300"

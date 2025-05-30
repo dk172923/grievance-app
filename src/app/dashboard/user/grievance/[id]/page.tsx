@@ -29,6 +29,7 @@ interface Grievance {
   language: string;
   translated_text?: string;
   ai_keywords?: string[];
+  grievance_resolved_file?: string;
 }
 
 interface Delegation {
@@ -38,11 +39,17 @@ interface Delegation {
   to_employee: { name: string; designation: string };
 }
 
+interface Document {
+  name: string;
+  url: string;
+}
+
 export default function GrievanceDetails() {
   const router = useRouter();
   const { id } = useParams();
   const [grievance, setGrievance] = useState<Grievance | null>(null);
   const [delegations, setDelegations] = useState<Delegation[]>([]);
+  const [documents, setDocuments] = useState<Document[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [showTranslation, setShowTranslation] = useState(false);
@@ -92,7 +99,8 @@ export default function GrievanceDetails() {
             employee:profiles!grievance_actions_employee_id_fkey (name, designation)
           ),
           language,
-          translated_text
+          translated_text,
+          grievance_resolved_file
         `)
         .eq('id', id)
         .eq('user_id', sessionData.session.user.id)
@@ -113,6 +121,17 @@ export default function GrievanceDetails() {
 
       if (delegationError) throw delegationError;
 
+      const { data: files, error: storageError } = await supabase.storage
+        .from('grievance-documents')
+        .list(`grievance-${id}`);
+
+      if (storageError) throw storageError;
+
+      const documents = files?.map(file => ({
+        name: file.name,
+        url: supabase.storage.from('grievance-documents').getPublicUrl(`grievance-${id}/${file.name}`).data.publicUrl,
+      })) || [];
+
       const normalizedGrievance = {
         ...grievanceData,
         categories: Array.isArray(grievanceData.categories) ? grievanceData.categories[0] : grievanceData.categories,
@@ -130,6 +149,7 @@ export default function GrievanceDetails() {
 
       setGrievance(normalizedGrievance as Grievance);
       setDelegations((delegationData || []) as Delegation[]);
+      setDocuments(documents);
       setTranslatedText(normalizedGrievance.translated_text || null);
     } catch (error: any) {
       console.error('Error fetching grievance:', error);
@@ -171,7 +191,6 @@ export default function GrievanceDetails() {
       const { data: sessionData } = await supabase.auth.getSession();
       if (!sessionData.session) throw new Error('User not authenticated.');
 
-      // Check if grievance is Resolved and within 7 days
       if (grievance.status !== 'Resolved') {
         throw new Error('Only Resolved grievances can be reopened.');
       }
@@ -183,10 +202,8 @@ export default function GrievanceDetails() {
         throw new Error('Cannot reopen grievance after 7 days.');
       }
 
-      // Append reopen reason to description
       const newDescription = `${grievance.description}\n\n[Reopened on ${now.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}] Reason: ${reopenReason}`;
       
-      // Update grievance status to Pending and description
       const { error: updateError } = await supabase
         .from('grievances')
         .update({
@@ -199,20 +216,18 @@ export default function GrievanceDetails() {
 
       if (updateError) throw new Error(`Failed to reopen grievance: ${updateError.message}`);
 
-      // Record reopen as a grievance action
       const actionText = `Grievance reopened by user. Reason: ${reopenReason}`;
       const { error: actionError } = await supabase
         .from('grievance_actions')
         .insert({
           grievance_id: grievance.id,
-          employee_id: sessionData.session.user.id, // User as actor
+          employee_id: sessionData.session.user.id,
           action_text: actionText,
           created_at: now.toISOString(),
         });
 
       if (actionError) {
         console.error('Error recording reopen action:', actionError);
-        // Rollback grievance update if action fails
         await supabase
           .from('grievances')
           .update({
@@ -224,11 +239,10 @@ export default function GrievanceDetails() {
         throw new Error(`Failed to record reopen action: ${actionError.message}`);
       }
 
-      // Notify assigned employee (if any)
       if (grievance.profiles && grievance.profiles.id) {
         const message = `Grievance #${grievance.id} ('${grievance.title}') has been reopened by the user. Reason: ${reopenReason}`;
         const { error: notifyError } = await supabase.from('notifications').insert({
-          user_id: grievance.profiles.id, // Use employee ID
+          user_id: grievance.profiles.id,
           message,
           grievance_id: grievance.id,
           is_read: false,
@@ -252,7 +266,7 @@ export default function GrievanceDetails() {
 
       alert('Grievance reopened successfully!');
       setReopenReason('');
-      fetchGrievance(); // Refresh grievance data
+      fetchGrievance();
     } catch (error: any) {
       console.error('Error reopening grievance:', error);
       setReopenError(error.message || 'Failed to reopen grievance.');
@@ -371,6 +385,43 @@ export default function GrievanceDetails() {
                   </p>
                 </div>
               </div>
+              {(documents.length > 0 || grievance.grievance_resolved_file) && (
+                <div className="mt-6">
+                  <h3 className="text-lg font-semibold text-gray-800 mb-2">Documents</h3>
+                  {documents.length > 0 && (
+                    <div>
+                      <strong className="text-gray-900">Uploaded Documents:</strong>
+                      <ul className="list-disc ml-6 mt-1">
+                        {documents.map((doc, idx) => (
+                          <li key={idx}>
+                            <a
+                              href={doc.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-indigo-600 hover:text-indigo-800"
+                            >
+                              {doc.name}
+                            </a>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {(grievance.status === 'Resolved' || grievance.status === 'Closed') && grievance.grievance_resolved_file && (
+                    <div className="mt-4">
+                      <strong className="text-gray-900">Resolution Document:</strong>{' '}
+                      <a
+                        href={grievance.grievance_resolved_file}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-indigo-600 hover:text-indigo-800"
+                      >
+                        View Resolution Document
+                      </a>
+                    </div>
+                  )}
+                </div>
+              )}
               {canReopen && (
                 <div className="mt-6">
                   <h3 className="text-lg font-semibold text-gray-800 mb-2">Reopen Grievance</h3>

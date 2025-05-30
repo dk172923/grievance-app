@@ -1,6 +1,6 @@
 import { ethers } from 'ethers';
 
-const CONTRACT_ADDRESS = '0xF944F411d65124a40af405B90fC72547a5301c03'; // Ensure this matches Hardhat deployment
+const CONTRACT_ADDRESS = '0x855FC9960B7D884211F5Af319bC72f95ff231ac5'; // Ensure this matches Hardhat deployment
 const provider = new ethers.JsonRpcProvider(process.env.NEXT_PUBLIC_GANACHE_URL || 'http://127.0.0.1:7545');
 
 async function getContract() {
